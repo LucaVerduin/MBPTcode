@@ -202,37 +202,29 @@ def _finish_qp(sigma, eps, nocc, p_state, mu, pade_freq, mf, mol,
     return out[0] if scalar else np.asarray(out)
 
 
-def solve_qp_energy_space_time(mf, mol, nocc, p_state,
-                               ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
-                               npade=DEFAULT_NPADE, w0=1.0, auxbasis=None,
-                               radii=None, factors=None, greedy=True,
-                               solver_mode='pole_strength', dm_correction=None,
-                               timings=None, distribute=False, comm=None,
-                               freq_block=None, scratch_dir=None,
-                               tau_target=DEFAULT_TAU_TARGET, extras=None,
-                               screen_r_cut=None, sigma_x='mf'):
-    """GW@RPA quasiparticle energy by the space-time route; restricted, DF only.
+def sigma_space_time(mf, mol, nocc, p_state,
+                     ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
+                     npade=DEFAULT_NPADE, w0=1.0, auxbasis=None,
+                     radii=None, factors=None, timings=None,
+                     distribute=False, comm=None,
+                     freq_block=None, scratch_dir=None,
+                     tau_target=DEFAULT_TAU_TARGET, extras=None,
+                     screen_r_cut=None):
+    """Sigma_c(i.omega) on the p_state diagonal, the space-time route.
 
-    Same quantity as `calc_qp_energy(selfenergy='GW', polarizability='RPA')`.
-    `p_state` is one orbital or a window; a window shares a single Sigma.
+    Everything `solve_qp_energy_space_time` does short of the Dyson QP solve:
+    builds the separable factors, the tau/frequency grids, W(i.omega) or
+    Wt(i.tau), and Sigma_c. Returns (sigma, eps, nocc, mu, pade_freq) -- what
+    `_finish_qp` needs to close the Dyson equation per state.
 
-    Sigma is built in the AO basis and projected onto the requested MO diagonal.
-    That contraction is flat in the number of states and leaves the AO matrix
-    behind for evGW/qsGW, at (npade, nao, nao) complex of memory.
+    Split out from `solve_qp_energy_space_time` for a self-consistent (scGW)
+    loop: an eigenvalue-only iteration re-runs exactly this with `eps` (hence
+    `mu` and the tau/frequency grids) taken from the previous iteration's QP
+    energies rather than the mean field's, while the root-finding step
+    (`_finish_qp`) is shared and unchanged. `solve_qp_energy_space_time` is
+    this function followed by that one step.
 
-    ntau:        imaginary-time points, or 'auto' to size from the
-                 Kaltak-Klimes-Kresse test integral to residual `tau_target`.
-    factors:     pre-built (X_mo, D), to reuse the factorization across calls.
-    freq_block:  build W blockwise in frequency, so chi0 is never formed.
-    scratch_dir: additionally cache the tau projection on disk.
-    distribute:  split the tau sums over MPI ranks and all-reduce; exact, no
-                 halo. The Dyson inversion stays replicated.
-    extras:      dict; receives W(omega=0) for a BSE on the same factors.
-    sigma_x:     which K builds the static exchange, see
-                 `static_exchange_diagonal`. 'mf' on an ISDF mean field puts
-                 the grid's K error into every QP energy at first order;
-                 'df-direct' removes it with one streamed three-index pass and
-                 no stored tensor, 'exact' with a full direct K.
+    See `solve_qp_energy_space_time` for the argument descriptions.
     """
     eps = get_orbital_energies(mf, representation='spatial')
     occ, virt = get_occ_virt_indices(eps, nocc)
@@ -285,11 +277,11 @@ def solve_qp_energy_space_time(mf, mol, nocc, p_state,
     tau_points = 0.5 * minimax_time_grid(ntau, *rS)[0]
 
     if freq_block or scratch_dir:
-        return _qp_blocked(X_mo, D, mf, mol, eps, nocc, mu, grid, tau_points,
-                           freq_points, pade_freq, p_state, want_static, extras,
-                           ntau, nranks, freq_block, scratch_dir, solver_mode,
-                           dm_correction, greedy, timings, X_ao, coords,
-                           screen_r_cut, sigma_x)
+        sigma = _sigma_blocked(X_mo, D, mf, mol, eps, nocc, mu, grid, tau_points,
+                               freq_points, pade_freq, p_state, want_static,
+                               extras, ntau, nranks, freq_block, scratch_dir,
+                               timings, X_ao, coords, screen_r_cut)
+        return sigma, eps, nocc, mu, pade_freq
 
     _t = _time.time()
     chi0 = chi0_imaginary_frequency(X_mo, D, eps, nocc, grid, mu=mu,
@@ -326,15 +318,55 @@ def solve_qp_energy_space_time(mf, mol, nocc, p_state,
     if timings is not None:
         timings['t_sigma'] = _time.time() - _t
 
+    return sigma, eps, nocc, mu, pade_freq
+
+
+def solve_qp_energy_space_time(mf, mol, nocc, p_state,
+                               ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
+                               npade=DEFAULT_NPADE, w0=1.0, auxbasis=None,
+                               radii=None, factors=None, greedy=True,
+                               solver_mode='pole_strength', dm_correction=None,
+                               timings=None, distribute=False, comm=None,
+                               freq_block=None, scratch_dir=None,
+                               tau_target=DEFAULT_TAU_TARGET, extras=None,
+                               screen_r_cut=None, sigma_x='mf'):
+    """GW@RPA quasiparticle energy by the space-time route; restricted, DF only.
+
+    Same quantity as `calc_qp_energy(selfenergy='GW', polarizability='RPA')`.
+    `p_state` is one orbital or a window; a window shares a single Sigma.
+
+    Sigma is built in the AO basis and projected onto the requested MO diagonal.
+    That contraction is flat in the number of states and leaves the AO matrix
+    behind for evGW/qsGW, at (npade, nao, nao) complex of memory.
+
+    ntau:        imaginary-time points, or 'auto' to size from the
+                 Kaltak-Klimes-Kresse test integral to residual `tau_target`.
+    factors:     pre-built (X_mo, D), to reuse the factorization across calls.
+    freq_block:  build W blockwise in frequency, so chi0 is never formed.
+    scratch_dir: additionally cache the tau projection on disk.
+    distribute:  split the tau sums over MPI ranks and all-reduce; exact, no
+                 halo. The Dyson inversion stays replicated.
+    extras:      dict; receives W(omega=0) for a BSE on the same factors.
+    sigma_x:     which K builds the static exchange, see
+                 `static_exchange_diagonal`. 'mf' on an ISDF mean field puts
+                 the grid's K error into every QP energy at first order;
+                 'df-direct' removes it with one streamed three-index pass and
+                 no stored tensor, 'exact' with a full direct K.
+    """
+    sigma, eps, nocc, mu, pade_freq = sigma_space_time(
+        mf, mol, nocc, p_state, ntau=ntau, nfreq=nfreq, npade=npade, w0=w0,
+        auxbasis=auxbasis, radii=radii, factors=factors, timings=timings,
+        distribute=distribute, comm=comm, freq_block=freq_block,
+        scratch_dir=scratch_dir, tau_target=tau_target, extras=extras,
+        screen_r_cut=screen_r_cut)
     return _finish_qp(sigma, eps, nocc, p_state, mu, pade_freq, mf, mol,
                       solver_mode, dm_correction, greedy, timings, sigma_x)
 
 
-def _qp_blocked(X_mo, D, mf, mol, eps, nocc, mu, grid, tau_points, freq_points,
-                pade_freq, p_state, want_static, extras, ntau, nranks,
-                freq_block, scratch_dir, solver_mode, dm_correction, greedy,
-                timings, X_ao, coords, screen_r_cut, sigma_x='mf'):
-    """Low-memory branch: chi0 is never formed.
+def _sigma_blocked(X_mo, D, mf, mol, eps, nocc, mu, grid, tau_points, freq_points,
+                   pade_freq, p_state, want_static, extras, ntau, nranks,
+                   freq_block, scratch_dir, timings, X_ao, coords, screen_r_cut):
+    """Low-memory branch: chi0 is never formed. Returns Sigma_c(i.omega) on p_state.
 
     Frequencies are built, inverted and folded into Wt(i.tau) a block at a time,
     so the peak is Wt plus one block instead of the whole frequency axis.
@@ -379,12 +411,10 @@ def _qp_blocked(X_mo, D, mf, mol, eps, nocc, mu, grid, tau_points, freq_points,
     if timings is not None:
         timings['t_sigma'] = _time.time() - _t
 
-    out = _finish_qp(sigma, eps, nocc, p_state, mu, pade_freq, mf, mol,
-                     solver_mode, dm_correction, greedy, timings, sigma_x)
-    del Wt_tau, sigma
+    del Wt_tau
     if wt_path and os.path.exists(wt_path):
         os.remove(wt_path)
-    return out
+    return sigma
 
 
 def solve_qp_diagonal_space_time(mf, mol, nocc, states=None, **kwargs):
