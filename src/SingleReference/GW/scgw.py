@@ -51,8 +51,12 @@ def sigma_matrix_scgw(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
     Pade grid -- the grid chi0/W already live on, since a Dyson loop needs
     Sigma_c and G comparable, frequency by frequency, to what built W.
 
-    Returns (sigma_mo, eps, mu, freq_points); sigma_mo is (nfreq, nmo, nmo)
-    complex.
+    Returns (sigma_mo, eps, mu, freq_points, freq_weights); sigma_mo is
+    (nfreq, nmo, nmo) complex. `freq_weights` are the matching minimax/Gauss-
+    Legendre quadrature weights on `[0, infty)` -- not needed to build G
+    itself (`dyson_green_function` closes the Dyson equation pointwise, no
+    integral), but exactly what a frequency-integral quantity built from G,
+    such as the density matrix, needs next.
     """
     eps = get_orbital_energies(mf, representation='spatial')
     occ, virt = get_occ_virt_indices(eps, nocc)
@@ -98,7 +102,7 @@ def sigma_matrix_scgw(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
         tau_points, freq_points, freq_points, mu=mu)
     sigma_mo = sigma_ao_to_mo(sigma_ao, mf.mo_coeff)
 
-    return sigma_mo, eps, mu, freq_points
+    return sigma_mo, eps, mu, freq_points, freq_weights
 
 
 def dyson_green_function(sigma_mo, eps, mu, freq_points):
@@ -123,6 +127,30 @@ def dyson_green_function(sigma_mo, eps, mu, freq_points):
     return G
 
 
+def density_matrix_scgw(G, freq_weights):
+    """gamma_pq = (1/2) delta_pq + (1/pi) sum_k w_k Re[G_pq(i.omega_k)].
+
+    The T=0 density matrix from a Matsubara Green's function, as a frequency
+    integral over the SAME [0, infty) grid G was built on -- `freq_weights`
+    must be the quadrature paired with the `freq_points` `G` lives on
+    (`sigma_matrix_scgw`'s third return value), not an independent choice.
+
+    Exact for the bare G0: Re[G0_pp(i.omega)] = -(eps_p-mu)/(omega^2+(eps_p-mu)^2)
+    integrates to +-1/2, so gamma_pp comes out exactly 1 (occupied) or 0
+    (virtual) -- the mean-field occupations, recovered without ever touching
+    eps directly. For the dressed G this is only as good as the quadrature:
+    Tr(gamma) should reproduce the electron count, and that check is NOT
+    automatic just because the same grid integrates chi0/W well.
+
+    G: (nfreq, nmo, nmo) complex, on `freq_points`. Returns gamma, (nmo, nmo)
+    real, in the MO basis G was built in (mf.mo_coeff @ gamma @ mf.mo_coeff.T
+    for the AO density).
+    """
+    nmo = G.shape[-1]
+    return 0.5 * np.eye(nmo) + (1.0 / np.pi) * np.einsum(
+        'k,kpq->pq', freq_weights, G.real)
+
+
 def solve_qp_energy_scgw(mf, mol, nocc, **kwargs):
     """One scGW iteration: the dressed Green's function via Dyson.
 
@@ -132,8 +160,9 @@ def solve_qp_energy_scgw(mf, mol, nocc, **kwargs):
     this into an actual self-consistency loop (the i.omega -> i.tau
     transform of G and a dressed replacement for `chi0_imaginary_frequency`).
 
-    Returns (G, sigma_mo, eps, mu, freq_points).
+    Returns (G, sigma_mo, eps, mu, freq_points, freq_weights).
     """
-    sigma_mo, eps, mu, freq_points = sigma_matrix_scgw(mf, mol, nocc, **kwargs)
+    sigma_mo, eps, mu, freq_points, freq_weights = sigma_matrix_scgw(
+        mf, mol, nocc, **kwargs)
     G = dyson_green_function(sigma_mo, eps, mu, freq_points)
-    return G, sigma_mo, eps, mu, freq_points
+    return G, sigma_mo, eps, mu, freq_points, freq_weights
