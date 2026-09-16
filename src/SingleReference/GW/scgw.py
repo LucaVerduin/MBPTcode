@@ -89,6 +89,8 @@ def sigma_matrix_scgw(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
     _, rS = self_energy_fit_ranges(eps, nocc, mu=mu)
     tau_points = 0.5 * minimax_time_grid(ntau, *rS)[0]
 
+    print(f'cos: {grid.cosft_tw.shape}',f'sin: {grid.sinft_tw.shape}')
+
     chi0 = chi0_imaginary_frequency(X_mo, D, eps, nocc, grid, mu=mu)
     eye = np.eye(chi0.shape[-1])
     for k in range(chi0.shape[0]):
@@ -121,6 +123,7 @@ def dyson_green_function(sigma_mo, eps, mu, freq_points):
     eye = np.eye(nmo)
     diag_eps = np.diag(eps)
     G = np.empty_like(sigma_mo)
+
     for k, w in enumerate(freq_points):
         g0_inv = (1j * w + mu) * eye - diag_eps
         G[k] = np.linalg.inv(g0_inv - sigma_mo[k])
@@ -147,11 +150,40 @@ def density_matrix_scgw(G, freq_weights):
     for the AO density).
     """
     nmo = G.shape[-1]
-    return 0.5 * np.eye(nmo) + (1.0 / np.pi) * np.einsum(
-        'k,kpq->pq', freq_weights, G.real)
+    averaged_term = (1.0 / np.pi) * np.einsum('k,kpq->pq', freq_weights, G.real)
+
+    # with np.printoptions(precision=5, suppress=True, linewidth=120):
+    #     print('(1/pi) sum_k w_k Re[G(i.omega_k)]:')
+    #     print(averaged_term + 0.5*np.eye(nmo))
+
+    return 0.5 * np.eye(nmo) + averaged_term
+
+def density_matrix_scgw_split(G, G0, eps, mu, freq_weights):
+    """Method for calculating the desity like 
+    Grumet, Liu, Kaltak, Klimes, Kresse, Phys. Rev. B 98 , 155143 (2018)
+
+    Should be more accurate than density_matrix_scgw 
+    since the gamma_hf part is solved analytically, without quadrature error
+    """
+
+    nmo = G.shape[-1]
+    gamma_hf = np.zeros((nmo,nmo))
+    gamma_c  = np.zeros((nmo,nmo))
+
+    for i, epsilon in enumerate(eps):
+        if mu-epsilon > 0:
+            gamma_hf[i,i] = 1
+
+    G_c = G - G0
+
+    gamma_c = (1/np.pi)*np.einsum('k,kpq->pq', freq_weights, G_c.real)
+
+    # print(np.trace(gamma_c+gamma_hf))
+
+    return gamma_c + gamma_hf
 
 
-def solve_qp_energy_scgw(mf, mol, nocc, **kwargs):
+def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split',**kwargs):
     """One scGW iteration: the dressed Green's function via Dyson.
 
     `sigma_matrix_scgw` builds Sigma_c(i.omega) as a full matrix on chi0/W's
@@ -164,5 +196,13 @@ def solve_qp_energy_scgw(mf, mol, nocc, **kwargs):
     """
     sigma_mo, eps, mu, freq_points, freq_weights = sigma_matrix_scgw(
         mf, mol, nocc, **kwargs)
+
     G = dyson_green_function(sigma_mo, eps, mu, freq_points)
+
+    if densmethod=='split':
+        gamma = density_matrix_scgw_split(G, G0, eps, mu, freq_weights)
+        G0 = dyson_green_function(np.zeros_like(sigma_mo), eps, mu, freq_points)
+    elif densmethod=='full':
+        gamma = density_matrix_scgw(G, freq_weights)
+
     return G, sigma_mo, eps, mu, freq_points, freq_weights
