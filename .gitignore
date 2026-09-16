@@ -17,3 +17,4 @@ src/Base/data/radii_cache/
 
 # Scratch calculation script, not part of the test suite.
 /run_scgw.py
+/run_scgw_Ne.py
