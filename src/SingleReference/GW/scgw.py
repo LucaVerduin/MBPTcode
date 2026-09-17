@@ -39,8 +39,59 @@ from src.SingleReference.LinearResponse.space_time import chi0_imaginary_frequen
 DEFAULT_NTAU = 'auto'
 DEFAULT_NFREQ = 'auto'
 
+def get_freq_points(nfreq, ntau, e_min, e_max, w0):
+    """ This function gets the frequency points either via the 
+    minimax method, or via gauss-legendre method, just like
+    in space_time.py
+    """
 
-def sigma_matrix_scgw(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
+    if nfreq is None or (isinstance(nfreq, str) and nfreq.lower() == 'auto'):
+        if ntau not in minimax_supported_sizes():
+            raise ValueError(
+                f"nfreq='auto' needs a tabulated minimax frequency grid at "
+                f'ntau = {ntau}; GreenX has {minimax_supported_sizes()}. Pass an '
+                'explicit nfreq.')
+        freq_points, freq_weights = minimax_frequency_grid(ntau, e_min, e_max)
+    else:
+        freq_points, freq_weights = gauss_legendre_grid(nfreq, w0=w0)
+
+    return freq_points, freq_weights
+
+def find_freq_points(nocc, eps, mu, ntau, e_min, e_max, w0):
+    """This function compares the trace of density of the noninteracting 
+    greens function to what is expected and uses that to determine
+    if minimax or gauss-legendre should be used.
+    """
+
+    nmo = len(eps)
+
+    freq_points_mm, freq_weights_mm = get_freq_points('auto', ntau, e_min, e_max, w0)
+    n_freq_mm = len(freq_points_mm)
+    freq_points_gl, freq_weights_gl = get_freq_points(n_freq_mm, ntau, e_min, e_max, w0)
+
+    sigma_0 = np.zeros((n_freq_mm, nmo, nmo), dtype=complex)
+
+    G0_mm = dyson_green_function(sigma_0, eps, mu, freq_points_mm)
+    G0_gl = dyson_green_function(sigma_0, eps, mu, freq_points_gl)
+
+    gamma_mm = density_matrix_scgw(G0_mm, freq_weights_mm)
+    gamma_gl = density_matrix_scgw(G0_gl, freq_weights_gl)
+
+    occ_ref = np.zeros(len(eps))
+    occ_ref[:nocc] = 1.0
+
+    d_occ_mm = np.max(np.abs(np.diag(gamma_mm) - occ_ref))
+    d_occ_gl = np.max(np.abs(np.diag(gamma_gl) - occ_ref))
+
+    if d_occ_mm < d_occ_gl:
+        print('using mm grid')
+        return freq_points_mm, freq_weights_mm
+    else:
+        print('using gl grid')
+        return freq_points_gl, freq_weights_gl
+
+
+def sigma_matrix_scgw_iteration1(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
                       w0=1.0, auxbasis=None, radii=None, factors=None,
                       tau_target=DEFAULT_TAU_TARGET, timings=None):
     """Sigma_c(i.omega) as a full MO matrix, on chi0/W's own frequency grid.
@@ -74,15 +125,10 @@ def sigma_matrix_scgw(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
                              else separable_factors(mf, mol, auxbasis=auxbasis,
                                                     radii=radii))
 
-    if nfreq is None or (isinstance(nfreq, str) and nfreq.lower() == 'auto'):
-        if ntau not in minimax_supported_sizes():
-            raise ValueError(
-                f"nfreq='auto' needs a tabulated minimax frequency grid at "
-                f'ntau = {ntau}; GreenX has {minimax_supported_sizes()}. Pass an '
-                'explicit nfreq.')
-        freq_points, freq_weights = minimax_frequency_grid(ntau, e_min, e_max)
-    else:
-        freq_points, freq_weights = gauss_legendre_grid(nfreq, w0=w0)
+    # find out if auto is better than just as many gauss-legendre points
+    # (in reference to density trace)
+    nmo = len(eps)
+    freq_points, freq_weights = find_freq_points(nocc, eps, mu, ntau, e_min, e_max, w0)
 
     grid = TimeFrequencyGrid.minimax_split(ntau, e_min, e_max,
                                            freq_points, freq_weights)
@@ -183,8 +229,10 @@ def density_matrix_scgw_split(G, G0, eps, mu, freq_weights):
     return gamma_c + gamma_hf
 
 
-def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split',**kwargs):
+def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split', **kwargs):
     """One scGW iteration: the dressed Green's function via Dyson.
+
+    In the future going to run the sc cycle
 
     `sigma_matrix_scgw` builds Sigma_c(i.omega) as a full matrix on chi0/W's
     own frequency grid; this closes the Dyson equation pointwise per
@@ -194,15 +242,19 @@ def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split',**kwargs):
 
     Returns (G, sigma_mo, eps, mu, freq_points, freq_weights).
     """
-    sigma_mo, eps, mu, freq_points, freq_weights = sigma_matrix_scgw(
+    sigma_mo, eps, mu, freq_points, freq_weights = sigma_matrix_scgw_iteration1(
         mf, mol, nocc, **kwargs)
 
     G = dyson_green_function(sigma_mo, eps, mu, freq_points)
 
-    if densmethod=='split':
-        gamma = density_matrix_scgw_split(G, G0, eps, mu, freq_weights)
+    if densmethod.lower()=='split':
         G0 = dyson_green_function(np.zeros_like(sigma_mo), eps, mu, freq_points)
-    elif densmethod=='full':
+        gamma = density_matrix_scgw_split(G, G0, eps, mu, freq_weights)
+
+    elif densmethod.lower()=='full':
         gamma = density_matrix_scgw(G, freq_weights)
+
+    else:
+        raise KeyError('densemethod implemented "full" or "split"')
 
     return G, sigma_mo, eps, mu, freq_points, freq_weights
