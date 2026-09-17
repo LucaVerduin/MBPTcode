@@ -57,7 +57,7 @@ def get_freq_points(nfreq, ntau, e_min, e_max, w0):
 
     return freq_points, freq_weights
 
-def find_freq_points(nocc, eps, mu, ntau, e_min, e_max, w0):
+def find_freq_points(nocc, eps, mu, ntau, e_min, e_max, w0, maxiter=20, max_points=40):
     """This function compares the trace of density of the noninteracting 
     greens function to what is expected and uses that to determine
     if minimax or gauss-legendre should be used.
@@ -84,11 +84,28 @@ def find_freq_points(nocc, eps, mu, ntau, e_min, e_max, w0):
     d_occ_gl = np.max(np.abs(np.diag(gamma_gl) - occ_ref))
 
     if d_occ_mm < d_occ_gl:
-        print('using mm grid')
+        print(f'Using mm grid with ntau:{ntau}, nfreq={n_freq_mm}')
         return freq_points_mm, freq_weights_mm
-    else:
-        print('using gl grid')
-        return freq_points_gl, freq_weights_gl
+
+    del gamma_mm, G0_mm
+
+    for _ in range(maxiter):
+        d_occ_gl_old = d_occ_gl
+        n_freq_mm += 4
+
+        if n_freq_mm >= max_points:
+            print(f'Using gl grid with ntau:{ntau}, nfreq={n_freq_mm - 4}')
+            return freq_points_gl, freq_weights_gl
+
+        sigma_0 = np.zeros((n_freq_mm, nmo, nmo), dtype=complex)
+        freq_points_gl, freq_weights_gl = get_freq_points(n_freq_mm, ntau, e_min, e_max, w0)
+        G0_gl = dyson_green_function(sigma_0, eps, mu, freq_points_gl)
+        gamma_gl = density_matrix_scgw(G0_gl, freq_weights_gl)
+        d_occ_gl = np.max(np.abs(np.diag(gamma_gl) - occ_ref))
+
+        if d_occ_gl_old - d_occ_gl < 0 or d_occ_gl < 1e-16:
+            print(f'Using gl grid with ntau:{ntau}, nfreq={n_freq_mm - 4}')
+            return freq_points_gl, freq_weights_gl
 
 
 def sigma_matrix_scgw_iteration1(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT_NFREQ,
