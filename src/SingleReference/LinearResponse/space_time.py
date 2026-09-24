@@ -39,13 +39,12 @@ import numpy as np
 from src.SingleReference.base import get_occ_virt_indices
 
 
-def polarizability_imaginary_time(X_o, X_v, eps_o, eps_v, tau_points,
+def polarizability_imaginary_time(Go, Gv, tau_points,
                                   out=None, beta=None):
     """Pi_PQ(i.tau) on the interpolation grid, shape (ntau, M, M).
 
-    X_o, X_v :     (M, n_occ) and (M, n_vir) collocation, occupied and virtual.
-    eps_o, eps_v : orbital energies SHIFTED so every eps_v - eps_o > 0; any
-                   chemical potential inside the gap does this.
+    Go: occupied G (positive tau)
+    Gv: virtual  G (negative tau)
     beta :         inverse temperature, giving the bosonic periodic object
                    Pi(tau) + Pi(beta - tau) that a Matsubara/IR grid needs.
                    Omit for the T = 0 half-line function of the minimax grids.
@@ -55,18 +54,21 @@ def polarizability_imaginary_time(X_o, X_v, eps_o, eps_v, tau_points,
     mirror contributes exactly as much as the direct term. Dropping it is a
     factor of two at every beta.
     """
-    M = X_o.shape[0]
-    ntau = len(tau_points)
+
     if out is None:
-        out = np.empty((ntau, M, M))
-    for k, tau in enumerate(tau_points):
-        Go = (X_o * np.exp(eps_o * tau)) @ X_o.T
-        Gv = (X_v * np.exp(-eps_v * tau)) @ X_v.T
-        np.multiply(Go, Gv, out=out[k])
-        if beta is not None:
-            tb = beta - tau
-            out[k] += (((X_o * np.exp(eps_o * tb)) @ X_o.T)
-                       * ((X_v * np.exp(-eps_v * tb)) @ X_v.T))
+        out = np.empty_like(Go)
+
+    for k in range(len(tau_points)):
+        np.multiply(Go[k], Gv[k], out=out[k])
+
+        # This reconstruction is not possible here anymore,
+        # since the creation of Go and Gv have been moved to Chi0_imaginary_frequency
+        # One would have to implement the finite temperature there
+        #
+        # if beta is not None:
+        #     tb = beta - tau
+        #     out[k] += (((X_o * np.exp(eps_o * tb)) @ X_o.T)
+        #                * ((X_v * np.exp(-eps_v * tb)) @ X_v.T))
     return out
 
 
@@ -95,8 +97,18 @@ def polarizability_projected_tau(X_o, X_v, e_o, e_v, D, tau,
     proj *= -2.0
     return proj
 
+def finish_chi0_imaginary_frequency(Go, Gv, D, grid):
+    """
+    Finishes chi_0_imaginary frequency when not using the
+    stream method, put in a seperate function since scgw
+    implementation resulted in duplication of this part of code
+    """
+    Pi_tau = polarizability_imaginary_time(Go, Gv,
+                                            grid.tau_points)
+    Pi_w = np.tensordot(grid.cosft_wt, Pi_tau, axes=(1, 0))
+    return -2.0 * np.einsum('Pa,wPQ,Qb->wab', D, Pi_w, D, optimize=True)
 
-def chi0_imaginary_frequency(X, D, eps, nocc, grid, mu=None, stream=True,
+def chi0_imaginary_frequency(X, D, eps, nocc, grid, Go=None, Gv=None, mu=None, stream=True,
                              tau_indices=None, tile_memory_gb=4.0):
     """chi0(i.omega) in the DF auxiliary basis, shape (nfreq, naux, naux).
 
@@ -114,6 +126,10 @@ def chi0_imaginary_frequency(X, D, eps, nocc, grid, mu=None, stream=True,
 
     but the peak drops from (ntau, M, M) to one (M, M).
     """
+
+    if Go is not None and Gv is not None:
+        return finish_chi0_imaginary_frequency(Go, Gv, D, grid)
+
     occ, virt = get_occ_virt_indices(eps, nocc)
     eps_o, eps_v = eps[occ], eps[virt]
     if mu is None:
@@ -123,10 +139,9 @@ def chi0_imaginary_frequency(X, D, eps, nocc, grid, mu=None, stream=True,
     e_o, e_v = eps_o - mu, eps_v - mu
 
     if not stream:
-        Pi_tau = polarizability_imaginary_time(X_o, X_v, e_o, e_v,
-                                               grid.tau_points)
-        Pi_w = np.tensordot(grid.cosft_wt, Pi_tau, axes=(1, 0))
-        return -2.0 * np.einsum('Pa,wPQ,Qb->wab', D, Pi_w, D, optimize=True)
+        Go = np.array([(X_o * np.exp(e_o * t)) @ X_o.T for t in grid.tau_points])
+        Gv = np.array([(X_v * np.exp(-e_v * t)) @ X_v.T for t in grid.tau_points])
+        return finish_chi0_imaginary_frequency(Go, Gv, D, grid)
 
     naux = D.shape[1]
     chi0 = np.zeros((grid.nfreq, naux, naux))
