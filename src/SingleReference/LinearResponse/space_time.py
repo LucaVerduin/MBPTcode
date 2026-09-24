@@ -36,6 +36,7 @@ supplying X_o and X_v.
 """
 import numpy as np
 
+from src.Base.constants import ISDF_TILE_GB
 from src.SingleReference.base import get_occ_virt_indices
 
 
@@ -73,7 +74,7 @@ def polarizability_imaginary_time(Go, Gv, tau_points,
 
 
 def polarizability_projected_tau(X_o, X_v, e_o, e_v, D, tau,
-                                 tile_memory_gb=4.0):
+                                 tile_memory_gb=ISDF_TILE_GB):
     """chi0 at ONE imaginary time, already projected to the auxiliary basis:
 
         proj_ab(tau) = -2 sum_PQ D[P,a] (Go_PQ Gv_PQ) D[Q,b]
@@ -108,8 +109,10 @@ def finish_chi0_imaginary_frequency(Go, Gv, D, grid):
     Pi_w = np.tensordot(grid.cosft_wt, Pi_tau, axes=(1, 0))
     return -2.0 * np.einsum('Pa,wPQ,Qb->wab', D, Pi_w, D, optimize=True)
 
+
 def chi0_imaginary_frequency(X, D, eps, nocc, grid, Go=None, Gv=None, mu=None, stream=True,
-                             tau_indices=None, tile_memory_gb=4.0):
+                             tau_indices=None, tile_memory_gb=ISDF_TILE_GB):
+
     """chi0(i.omega) in the DF auxiliary basis, shape (nfreq, naux, naux).
 
     X :    (M, norb) collocation in the MO basis.

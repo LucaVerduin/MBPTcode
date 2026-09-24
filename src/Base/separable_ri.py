@@ -64,12 +64,14 @@ Reported behaviour to check against: ~3x the auxiliary basis size (320 points
 per C/N/O, 180 per H at cc-pVTZ/cc-pVTZ-RI), meV agreement with RI-V, empirical
 exponent 3.07, crossover with quartic RI-V at ~350 electrons.
 """
+import hashlib
 import json
 import os
 import time
 
 import numpy as np
 import scipy.linalg
+from scipy.optimize import minimize, basinhopping
 from pyscf import df, gto
 from pyscf.dft import gen_grid
 
@@ -102,6 +104,17 @@ DEFAULT_REGULARIZATION = 4e-7
 
 #: Emphasis on the low multipoles of the test co-densities (their Sec. II E).
 ANGULAR_WEIGHTS = {0: 4.0, 1: 2.0}
+
+
+def auxmol_key(auxmol):
+    """A hashable identity for an auxiliary basis, for caching on its CONTENT.
+
+    Never `id(auxmol)`: a fresh object's id is one python is free to reuse once
+    the previous one is collected, and a cache keyed that way hands back
+    another basis's result -- intermittently, and looking perfectly reasonable.
+    """
+    return (auxmol.nbas, auxmol.nao,
+            auxmol._bas.tobytes(), auxmol._env.tobytes())
 
 
 def lebedev_subshells():
@@ -501,6 +514,24 @@ def fit_M(D, F, regularization=DEFAULT_REGULARIZATION):
     return ((F @ Dt.T) @ np.linalg.inv(G)) * d[None, :]
 
 
+def fit_M_stable(D, F, regularization=DEFAULT_REGULARIZATION):
+    """`fit_M` with the explicit inverse replaced by a Cholesky solve.
+
+    The same estimator, a better numerical realization of it. `fit_M` forms
+    np.linalg.inv(G) at cond(G) ~ 2e8, which costs digits in the forward pass;
+    production's default `fit_M_streaming` already solves rather than inverts,
+    and `build_separable_ri` calls it "the better conditioned of the two".
+    """
+    s = np.sqrt(np.einsum('kr,kr->k', D, D))
+    s = np.where(s == 0.0, 1.0, s)
+    d = 1.0 / s
+    Dt = D * d[:, None]
+    G = Dt @ Dt.T
+    G[np.diag_indices_from(G)] += regularization
+    cho = scipy.linalg.cho_factor(G, lower=True)
+    return scipy.linalg.cho_solve(cho, (F @ Dt.T).T).T * d[None, :]
+
+
 def build_separable_ri(mol, coords, auxbasis=None, auxmol=None,
                        regularization=DEFAULT_REGULARIZATION,
                        l_max_second=2, streaming=True, block_memory_gb=4.0,
@@ -537,6 +568,37 @@ def build_separable_ri(mol, coords, auxbasis=None, auxmol=None,
     Z = M.T @ V @ M
     X = mol.eval_gto('GTOval_sph', coords)               # (nk, nao)
     return X, Z, M
+
+
+def aux_metric_sqrt(auxmol, environment=None, V=None):
+    """V^(1/2) of the auxiliary Coulomb metric: the gauge D = M^T V^(1/2) is built in.
+
+    An environment substitutes v -> v + vtilde, and the interaction enters the
+    factorization only through this metric (Z = D D^T fits pair densities
+    against V), so dressing it is the whole substitution (Duchemin, Jacquemin
+    and Blase, J. Chem. Phys. 144, 164106 (2016), Eq. 16; the DF analogue is
+    SolventScreening.whitened_transform). The least-squares fit itself keeps
+    the bare metric; only the gauge is dressed. v + vtilde is still a positive
+    kernel, so a negative eigenvalue means the discretized reaction field
+    over-screens the bare interaction and is an error, not a truncation.
+
+    environment: anything with `aux_kernel(auxmol)`, returning vtilde_PQ or
+    None when nothing screens (src.Base.environment). V: the bare (P|Q), if
+    already formed.
+    """
+    V = auxmol.intor('int2c2e', aosym='s1') if V is None else V
+    kernel = None if environment is None else environment.aux_kernel(auxmol)
+    if kernel is not None:
+        V = V + kernel
+    w, v = np.linalg.eigh(V)
+    if kernel is not None and w.min() < -1e-10 * w.max():
+        raise RuntimeError(
+            f"the screened auxiliary metric v + vtilde is indefinite "
+            f"(smallest eigenvalue {w.min():.3e}): the reaction field "
+            f"over-screens the bare interaction. Check eps and the cavity "
+            f"(lebedev_order / vdw_scale).")
+    keep = w > 1e-12 * w.max()
+    return (v[:, keep] * np.sqrt(w[keep])) @ v[:, keep].T
 
 
 def fit_error_coulomb(mol, auxmol, coords, M=None, l_max_second=2,
@@ -734,7 +796,6 @@ def _radii_settings(counts, r_min, r_max, l_max_second, regularization,
 
 
 def _radii_cache_path(element, basis, auxbasis, settings):
-    import hashlib
     key = json.dumps([element, str(basis), str(auxbasis), settings], sort_keys=True)
     tag = hashlib.sha1(key.encode()).hexdigest()[:12]
     d = os.path.join(os.path.dirname(__file__), 'data', 'radii_cache')
@@ -783,7 +844,6 @@ def optimize_atomic_radii(element, basis, auxbasis, counts=None,
         magnesium's density altogether; it is kept for n_start=1 only so that
         every existing cached and shipped grid keeps its key.
     """
-    from scipy.optimize import minimize, basinhopping
 
     counts = counts or _DEFAULT_COUNTS
 
