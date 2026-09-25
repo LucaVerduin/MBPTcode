@@ -171,7 +171,7 @@ def sigma_matrix_scgw_iteration1(mf, mol, nocc, ntau=DEFAULT_NTAU, nfreq=DEFAULT
         tau_points, freq_points, freq_points, mu=mu)
     sigma_mo = sigma_ao_to_mo(sigma_ao, mf.mo_coeff)
 
-    return sigma_mo, eps, mu, freq_points, freq_weights
+    return sigma_mo, eps, mu, freq_points, freq_weights, X_mo, D, grid
 
 
 def dyson_green_function(sigma_mo, eps, mu, freq_points):
@@ -298,8 +298,9 @@ def _mu_cycle_find_trace(mu, freq_points, freq_weights, sigma_mo, gamma, V, h_mo
     return np.trace(gamma), gamma, G, F
 
 def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
-            mu_step=0.1, trace_tol=1e-8, mu_tol=1e-10,
-            max_bracket_iter=50, max_bisect_iter=100, densmethod='full'):
+            mu_step=0.01, trace_tol=1e-8, mu_tol=1e-10,
+            max_bracket_iter=50, max_bisect_iter=100, densmethod='full',
+            stall_trace_tol=1e-4):
     """Bisection search for mu with Tr[gamma(mu)] = nocc.
 
     Sigma (sigma_mo) is held FIXED for the whole call; F and gamma are
@@ -315,6 +316,16 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
     trial mu -- 'split' builds G_hf alongside G and uses
     density_matrix_scgw_split; 'full' (default) uses the plain
     frequency-integral density_matrix_scgw.
+
+    stall_trace_tol: the bracket can collapse below mu_tol before
+    |trace-nocc| < trace_tol -- ordinarily a numerical noise floor right at
+    the root, harmless if |trace-nocc| is still small (< stall_trace_tol).
+    But F is rebuilt from gamma at every trial mu, so trace(mu) is not
+    guaranteed continuous/monotonic (an eigenvalue of F crossing mu inside
+    the bracket can make it jump); when that happens bisection can collapse
+    the bracket on the wrong side of the jump with |trace-nocc| still large.
+    Silently returning that as "converged" previously fed a wildly wrong
+    gamma/F into the next scGW iteration. Now it raises instead.
 
     Returns (mu, G, gamma, F).
     """
@@ -353,9 +364,25 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
             mu_mid, freq_points, freq_weights, sigma_mo, gamma_lo, V, h_mo,
             densmethod=densmethod)
 
-        if abs(trace_mid - nocc) < trace_tol or abs(mu_hi - mu_lo) < mu_tol:
+        if abs(trace_mid - nocc) < trace_tol:
             print(f'mu_cycle converged: mu={mu_mid}, trace={trace_mid}\n')
             return mu_mid, G_mid, gamma_mid, F_mid
+
+        if abs(mu_hi - mu_lo) < mu_tol:
+            if abs(trace_mid - nocc) < stall_trace_tol:
+                print(f'mu_cycle converged (bracket collapsed, trace within '
+                     f'stall_trace_tol): mu={mu_mid}, trace={trace_mid}\n')
+                return mu_mid, G_mid, gamma_mid, F_mid
+            raise RuntimeError(
+                f'mu_cycle: bisection bracket collapsed to width '
+                f'{abs(mu_hi - mu_lo):.2e} (< mu_tol={mu_tol:.1e}) with '
+                f'|trace-nocc| = {abs(trace_mid - nocc):.2e} at mu={mu_mid} -- '
+                f'nowhere near trace_tol={trace_tol:.1e} or '
+                f'stall_trace_tol={stall_trace_tol:.1e}. trace(mu) is likely '
+                f'not continuous/monotonic across this bracket (e.g. an '
+                f'eigenvalue of F crossing mu), which breaks the bisection '
+                f'assumption -- a smaller mu_step or a damped update is '
+                f'needed, not more bisection iterations.')
 
         if (trace_lo - nocc) * (trace_mid - nocc) <= 0:
             mu_hi = mu_mid
@@ -365,7 +392,7 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
     raise RuntimeError(f'mu_cycle: did not converge in {max_bisect_iter} '
                        f'iterations (|trace-nocc| = {abs(trace_mid - nocc):.2e})')
 
-def calc_new_sigma(G, freq_points, tau_points, F, mu, X_mo, D):
+def calc_new_sigma(G, freq_points, freq_weights, tau_points, nocc, F, mu, X_mo, D, grid):
     """G(i.omega) -> the next iteration's Sigma_c(i.omega), via the dressed
     polarizability chi, the Dyson-inverted W, and Sigma = i G W as a
     pointwise product in imaginary time -- the same construction as
@@ -417,29 +444,25 @@ def calc_new_sigma(G, freq_points, tau_points, F, mu, X_mo, D):
     Ghat_lesser = np.einsum('pi,tij,qj->tpq', X_mo, G_lesser, X_mo, optimize=True)
     Ghat_greater = np.einsum('pi,tij,qj->tpq', X_mo, G_greater, X_mo, optimize=True)
 
-    Pi_thc = Ghat_greater * Ghat_lesser
-
-    # THC grid -> auxiliary (DF) basis. +2.0, not -2.0 -- see docstring.
-    chi_tau = 2.0 * np.einsum('Pa,tPQ,Qb->tab', D, Pi_thc, D, optimize=True)
-
-    # tau -> omega: chi is real/even, like chi0 (a two-particle/transition-
-    # energy object), so only the cosine transform is needed, no sine half.
-    # Fit against F's own TRANSITION range -- the occupied/virtual split by
-    # mu among F's eigenvalues -- not G's per-orbital rG from above; this is
-    # the same e_min/e_max chi0_imaginary_frequency itself needs, just
-    # generalized off F instead of the stale bare eps.
+    # F's own transition-energy range (generalized off F's eigenvalues
+    # instead of the bare eps/occ/virt split, since F is no longer diagonal
+    # in the original orbital basis once rebuilt from a scGW density).
     occ_mask = eps_F < mu
     e_min_F = eps_F[~occ_mask].min() - eps_F[occ_mask].max()
     e_max_F = eps_F[~occ_mask].max() - eps_F[occ_mask].min()
-    Ctw_chi, _ = minimax_transform_weights(COSINE_TW, tau_points, freq_points,
-                                           e_min_F, e_max_F, warn=False)
-    chi_omega = np.einsum('wt,tab->wab', Ctw_chi, chi_tau, optimize=True)
+
+    grid_chi = TimeFrequencyGrid.minimax_split(len(tau_points), e_min_F, e_max_F,
+                                           freq_points, freq_weights)
+
+    chi_omega = chi0_imaginary_frequency(X_mo, D, eps_F, nocc, grid_chi, Go=Ghat_greater, Gv=-Ghat_lesser)
 
     # Dyson invert chi(i.omega) -> W(i.omega), same pointwise pattern as the
     # chi0 -> W inversion elsewhere.
+
     naux = chi_omega.shape[-1]
     eye_aux = np.eye(naux)
     W_omega = np.empty_like(chi_omega)
+    print(eye_aux.shape, W_omega.shape)
     for k in range(chi_omega.shape[0]):
         W_omega[k] = np.linalg.inv(eye_aux - chi_omega[k])
 
@@ -448,11 +471,13 @@ def calc_new_sigma(G, freq_points, tau_points, F, mu, X_mo, D):
     # self_energy_fit_ranges' rW -- the screened interaction has weight
     # BELOW the smallest transition, so an unpadded range misfits exactly
     # where W is largest.
+
     rW_F = (0.3 * e_min_F, 3.0 * e_max_F)
     Ctw_W, _ = minimax_transform_weights(COSINE_WT, tau_points, freq_points, *rW_F, warn=False)
     Wt_tau = np.einsum('tk,kab->tab', Ctw_W, W_omega - eye_aux, optimize=True)
 
     # aux basis -> ISDF/THC grid, per tau point: Zt(tau) = D Wt(tau) D^T.
+
     Zt_tau = np.einsum('Pa,tab,Qb->tPQ', D, Wt_tau, D, optimize=True)
 
     # Sigma = i G W, pointwise product in imaginary time, THC grid. Unlike
@@ -461,12 +486,15 @@ def calc_new_sigma(G, freq_points, tau_points, F, mu, X_mo, D):
     # explicitly SUBTRACTS it into its greater accumulator, which is exactly
     # equivalent to using G_greater (with its own built-in minus) directly
     # with a plain +, as done here.
+
+
     sig_lesser_thc = Zt_tau * Ghat_lesser
     sig_greater_thc = Zt_tau * Ghat_greater
 
     # THC grid -> MO basis directly (X_mo for both indices -- Sigma comes
     # back in MO basis, no AO round trip needed, per self_energy_matrix_
     # imaginary_time's own documented X_ao/X_mo flexibility).
+
     sig_lesser = np.einsum('pi,tpq,qj->tij', X_mo, sig_lesser_thc, X_mo, optimize=True)
     sig_greater = np.einsum('pi,tpq,qj->tij', X_mo, sig_greater_thc, X_mo, optimize=True)
 
@@ -477,13 +505,14 @@ def calc_new_sigma(G, freq_points, tau_points, F, mu, X_mo, D):
     # decay (dG) with W's transition range -- Sigma = G*W is a PRODUCT, so
     # its decay rates are SUMS of the two factors' own (self_energy_fit_
     # ranges' rS, generalized off F instead of the bare eps).
+
     rS_F = (0.3 * (dG.min() + e_min_F), 3.0 * (dG.max() + e_max_F))
     C, _ = minimax_transform_weights(COSINE_TW, tau_points, freq_points, *rS_F, warn=False)
     S, _ = minimax_transform_weights(SINE_TW, tau_points, freq_points, *rS_F, warn=False)
     sigma_new = (np.einsum('wt,tij->wij', C, even, optimize=True)
                 + 1j * np.einsum('wt,tij->wij', S, odd, optimize=True))
 
-    return (G_lesser + 1j * G_greater), sigma_new
+    return (G_lesser + 1j * G_greater), chi_omega, W_omega, sigma_new
 
 def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split', **kwargs):
     """One scGW iteration: the dressed Green's function via Dyson.
@@ -500,7 +529,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split', **kwargs):
     h_mo + J[gamma] - 0.5*K[gamma] (see `build_new_F`), the updated Fock
     matrix in mf.mo_coeff's basis built from the scGW density `gamma`.
     """
-    sigma_mo, eps, mu, freq_points, freq_weights = sigma_matrix_scgw_iteration1(
+    sigma_mo, eps, mu, freq_points, freq_weights, X_mo, D, grid = sigma_matrix_scgw_iteration1(
         mf, mol, nocc, **kwargs)
 
     G = dyson_green_function(sigma_mo, eps, mu, freq_points)
@@ -525,7 +554,11 @@ def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split', **kwargs):
                                freq_weights, sigma_mo, V, h_mo, densmethod=densmethod)
 
     # Evaluate now density of G
+
     n_occ_gamma = np.trace(gamma)
-    print(f'n_occ_gamma {n_occ_gamma}, expected 1.0')
+    print(f'n_occ_gamma {n_occ_gamma}, expected {nocc}')
+
+    G_tau, chi_omega, W_omega, sigma_new = calc_new_sigma(
+        G, freq_points, freq_weights, grid.tau_points, nocc, F, mu, X_mo, D, grid)
 
     return G, sigma_mo, eps, mu, freq_points, freq_weights, F
