@@ -313,17 +313,16 @@ def build_G_from_F(mu, freq_points, sigma_mo, F, return_G_hf=False):
             G_hf[k] = np.linalg.inv((G_hf_inv))
         return G, G_hf
 
-def _mu_cycle_find_trace(mu, freq_points, freq_weights, sigma_mo, gamma, V, h_mo, grid_f=None, grid_kind='IR',
+def _mu_cycle_find_trace(mu, F, freq_points, freq_weights, sigma_mo, grid_f=None, grid_kind='IR',
                          densmethod='full'):
-    """One (F, G, gamma) update at a trial mu. Returns (trace, gamma, G, F).
+    """One gamma(mu) evaluation at FIXED F. Returns (trace, gamma, G).
 
-    Sigma (sigma_mo) is the only thing held fixed across a whole mu_cycle
-    call; F is rebuilt from the CURRENT gamma estimate at every trial mu
-    (the paper's inner loop over G, F, mu together, with only Sigma frozen
-    until the next outer iteration) and threaded forward from one trial to
-    the next by the caller.
+    F is held fixed for the whole mu bisection -- only mu moves -- so this
+    is the inner "2.a Find mu" loop, which only ever sees a single, frozen
+    set of poles. F is rebuilt from the mu-converged gamma exactly once per
+    outer "Build G" iteration (by mu_cycle's caller, as "2.b Build F"), not
+    once per trial mu.
     """
-    F = build_new_F(gamma, V, h_mo)
     if grid_kind.upper() == 'IR':
         G = build_G_from_F(mu, grid_f.omega_points, sigma_mo, F)
         gamma = density_matrix_ir(G, grid_f)
@@ -333,18 +332,29 @@ def _mu_cycle_find_trace(mu, freq_points, freq_weights, sigma_mo, gamma, V, h_mo
     else:
         G = build_G_from_F(mu, freq_points, sigma_mo, F)
         gamma = density_matrix_scgw(G, freq_weights)
-    return np.trace(gamma), gamma, G, F
+    return np.trace(gamma), gamma, G
 
 def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
             mu_step=0.000001, trace_tol=1e-8, mu_tol=1e-10,
             max_bracket_iter=50, max_bisect_iter=100, grid_f=None, grid_kind='IR', densmethod='full',
             stall_trace_tol=1e-4):
-    """Bisection search for mu with Tr[gamma(mu)] = nocc.
+    """Bisection search for mu with Tr[gamma(mu)] = nocc, at FIXED F.
 
-    Sigma (sigma_mo) is held FIXED for the whole call; F and gamma are
-    rebuilt from each other at every trial mu -- G, F, and mu form one inner
-    loop, per the paper, threaded forward from one trial to the next rather
-    than reset each time.
+    Sigma (sigma_mo) AND F are both held fixed for the whole call: F is
+    built once, from the incoming gamma, before the search starts, and
+    never rebuilt from the trial gammas the bisection generates along the
+    way. This is the inner "2.a Find mu" loop; it is the caller's job to
+    rebuild F from the converged gamma ("2.b Build F") once this returns,
+    before deciding whether another outer "Build G" iteration is needed.
+
+    With F fixed, Tr[gamma(mu)] is the ordinary single-particle counting
+    function of mu (monotonically non-decreasing: raising mu can only pull
+    more poles below the Fermi level), which is what makes the direction
+    convention below ("too many electrons -> lower mu") and plain bisection
+    valid in the first place. Rebuilding F from gamma at every trial mu (the
+    previous implementation) let the poles of G move during the search
+    itself, which is what produced the non-monotonic, discontinuous
+    trace(mu) seen on the IR route.
 
     Two phases: an expanding-step search to bracket the root (step grows
     while still hunting for the sign flip), then ordinary bisection, whose
@@ -356,19 +366,18 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
     frequency-integral density_matrix_scgw.
 
     stall_trace_tol: the bracket can collapse below mu_tol before
-    |trace-nocc| < trace_tol -- ordinarily a numerical noise floor right at
-    the root, harmless if |trace-nocc| is still small (< stall_trace_tol).
-    But F is rebuilt from gamma at every trial mu, so trace(mu) is not
-    guaranteed continuous/monotonic (an eigenvalue of F crossing mu inside
-    the bracket can make it jump); when that happens bisection can collapse
-    the bracket on the wrong side of the jump with |trace-nocc| still large.
-    Silently returning that as "converged" previously fed a wildly wrong
-    gamma/F into the next scGW iteration. Now it raises instead.
+    |trace-nocc| < trace_tol -- a numerical noise floor right at the root,
+    harmless if |trace-nocc| is still small (< stall_trace_tol). Silently
+    returning that as "converged" previously fed a wildly wrong gamma/F into
+    the next scGW iteration. Now it raises instead.
 
-    Returns (mu, G, gamma, F).
+    Returns (mu, G, gamma, F), where F is the single fixed F used
+    throughout this call.
     """
     F = build_new_F(gamma, V, h_mo)
-    trace_old = np.trace(gamma)
+    trace_old, gamma, G = _mu_cycle_find_trace(
+        mu, F, freq_points, freq_weights, sigma_mo, grid_f=grid_f, grid_kind=grid_kind,
+        densmethod=densmethod)
 
     print(f'Trace before mu-cycle: {trace_old}')
 
@@ -378,55 +387,51 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
     # --- Phase 1: bracket the root ---
     step = mu_step
     direction = -1.0 if trace_old > nocc else 1.0
-    # direction = 1.0 if trace_old > nocc else -1.0
-    mu_a, trace_a, gamma_a = mu, trace_old, gamma
+    mu_a, trace_a = mu, trace_old
 
     for _ in range(max_bracket_iter):
         mu_b = mu_a + direction * step
-        trace_b, gamma_b, G_b, F_b = _mu_cycle_find_trace(
-            mu_b, freq_points, freq_weights, sigma_mo, gamma_a, V, h_mo,
-            grid_f=grid_f, densmethod=densmethod)
+        trace_b, gamma_b, G_b = _mu_cycle_find_trace(
+            mu_b, F, freq_points, freq_weights, sigma_mo, grid_f=grid_f, grid_kind=grid_kind,
+            densmethod=densmethod)
 
         if (trace_a - nocc) * (trace_b - nocc) <= 0:
             break
-        mu_a, trace_a, gamma_a = mu_b, trace_b, gamma_b
+        mu_a, trace_a = mu_b, trace_b
         step *= 1.5
     else:
         raise RuntimeError(f'mu_cycle: failed to bracket nocc={nocc} '
                            f'within {max_bracket_iter} probes')
 
     # --- Phase 2: bisection ---
-    mu_lo, mu_hi, trace_lo, gamma_lo = mu_a, mu_b, trace_a, gamma_a
+    mu_lo, mu_hi, trace_lo = mu_a, mu_b, trace_a
+    gamma_mid, G_mid = gamma_b, G_b
     for _ in range(max_bisect_iter):
         mu_mid = 0.5 * (mu_lo + mu_hi)
-        trace_mid, gamma_mid, G_mid, F_mid = _mu_cycle_find_trace(
-            mu_mid, freq_points, freq_weights, sigma_mo, gamma_lo, V, h_mo,
-            grid_f=grid_f, densmethod=densmethod)
+        trace_mid, gamma_mid, G_mid = _mu_cycle_find_trace(
+            mu_mid, F, freq_points, freq_weights, sigma_mo, grid_f=grid_f, grid_kind=grid_kind,
+            densmethod=densmethod)
 
         if abs(trace_mid - nocc) < trace_tol:
             print(f'mu_cycle converged: mu={mu_mid}, trace={trace_mid}\n')
-            return mu_mid, G_mid, gamma_mid, F_mid
+            return mu_mid, G_mid, gamma_mid, F
 
         if abs(mu_hi - mu_lo) < mu_tol:
             if abs(trace_mid - nocc) < stall_trace_tol:
                 print(f'mu_cycle converged (bracket collapsed, trace within '
                      f'stall_trace_tol): mu={mu_mid}, trace={trace_mid}\n')
-                return mu_mid, G_mid, gamma_mid, F_mid
+                return mu_mid, G_mid, gamma_mid, F
             raise RuntimeError(
                 f'mu_cycle: bisection bracket collapsed to width '
                 f'{abs(mu_hi - mu_lo):.2e} (< mu_tol={mu_tol:.1e}) with '
                 f'|trace-nocc| = {abs(trace_mid - nocc):.2e} at mu={mu_mid} -- '
                 f'nowhere near trace_tol={trace_tol:.1e} or '
-                f'stall_trace_tol={stall_trace_tol:.1e}. trace(mu) is likely '
-                f'not continuous/monotonic across this bracket (e.g. an '
-                f'eigenvalue of F crossing mu), which breaks the bisection '
-                f'assumption -- a smaller mu_step or a damped update is '
-                f'needed, not more bisection iterations.')
+                f'stall_trace_tol={stall_trace_tol:.1e}.')
 
         if (trace_lo - nocc) * (trace_mid - nocc) <= 0:
             mu_hi = mu_mid
         else:
-            mu_lo, trace_lo, gamma_lo = mu_mid, trace_mid, gamma_mid
+            mu_lo, trace_lo = mu_mid, trace_mid
 
     raise RuntimeError(f'mu_cycle: did not converge in {max_bisect_iter} '
                        f'iterations (|trace-nocc| = {abs(trace_mid - nocc):.2e})')
@@ -728,7 +733,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kw
         print(f'G0 (IR, bare): shape={G0.shape}, max|G0|={np.max(np.abs(G0)):.4e}')
 
         gamma = density_matrix_ir(G0, grid_f)
-        print(f'Trace gamma: {np.trace(gamma)}, expected nocc: {nocc}')
+        print(f'Trace gamma_G0: {np.trace(gamma)}, expected nocc: {nocc}')
 
         G_tau, chi_omega, W_omega, sigma_new = calc_new_sigma_ir(
             G0, grid_f, grid_b, X_mo, D)
@@ -739,13 +744,21 @@ def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kw
         F = build_new_F(gamma, V, h_mo)
         G = build_G_from_F(mu, grid_f.omega_points, sigma_new, F)
 
-        
+        gamma_G = density_matrix_ir(G,grid_f)
+        print(f'Trace gamma_G: {np.trace(gamma_G)}, expected nocc: {nocc}')
+
+        try:
+            _, _, _, _ = mu_cycle(mu, G0, gamma, nocc, freq_points=None, freq_weights=None,
+                            sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
+        except Exception as e:
+            print(f'mu_cycle failed: {e!r}')
+
+        return G, F, G0, mu, gamma, sigma_new, V, h_mo, grid_f
 
         # This mu-cycle has to be fixed / implemented properly still
         # The mu-cycle does not converge, may be because the initial G0 density is so close to n_occ
         #
-        # mu, G, gamma, F = mu_cycle(mu, G0, gamma, nocc, freq_points=None, freq_weights=None,
-        #                            sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
+
 
         # with np.printoptions(precision=3, suppress=False, linewidth=120):
         #     print(gamma)
