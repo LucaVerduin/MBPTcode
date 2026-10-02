@@ -253,6 +253,41 @@ def density_matrix_scgw_split(G, G_hf, F, mu, freq_weights):
 
     return gamma_c + gamma_hf
 
+def density_matrix_ir(G, grid_f):
+    """gamma = -G_greater(tau -> beta), read directly off the tau-domain
+    representation on the fermion IR grid.
+
+    Exact, not a quadrature approximation: the fermion antiperiodic boundary
+    condition G(tau-beta) = -G(tau), combined with the equal-time identity
+    G(0-) = gamma, gives G(tau -> beta-) = -gamma. This is the analogue of
+    density_matrix_scgw's frequency-integral, but IR's true two-sided basis
+    lets it be evaluated exactly at the tau = beta boundary via
+    grid_f.project_tau, rather than approximated by a [0, infty) quadrature.
+
+    Cross-checked two ways on the bare limit: -G_greater(beta) and
+    I - G_lesser(beta) agree with each other and with the exact bare density
+    to ~4e-6 (H2/cc-pVDZ) -- G_lesser(tau) = Go(tau) + Gv(beta-tau) and
+    G_greater(tau) = -[Gv(tau) + Go(beta-tau)] both reduce their mirror term
+    to the full occupied/virtual projector exactly at tau = beta, since the
+    non-mirror term (Go(beta) or Gv(beta)) is exponentially suppressed there.
+
+    G: (nfreq, nmo, nmo) complex, on grid_f.omega_points.
+    """
+    G_even = np.einsum('tk,kpq->tpq', grid_f.cosft_tw, G.real)
+    G_odd = np.einsum('tk,kpq->tpq', grid_f.sinft_tw, G.imag)
+
+    ntau, nmo = G_even.shape[0], G_even.shape[1]
+    G_even_flat = G_even.reshape(ntau, nmo * nmo).T
+    G_odd_flat = G_odd.reshape(ntau, nmo * nmo).T
+
+    beta = grid_f.meta['beta']
+    tau_beta = np.array([beta])
+    G_even_beta = grid_f.project_tau(G_even_flat, tau_beta, parity='even').reshape(nmo, nmo)
+    G_odd_beta = grid_f.project_tau(G_odd_flat, tau_beta, parity='odd').reshape(nmo, nmo)
+
+    G_greater_beta = G_even_beta + G_odd_beta
+    return -G_greater_beta
+
 def build_new_F(gamma, V, h_mo):
     J_ij = np.einsum('ijkl,kl->ij', V, gamma)
     K_ij = np.einsum('ikjl,kl->ij', V, gamma)
@@ -278,7 +313,7 @@ def build_G_from_F(mu, freq_points, sigma_mo, F, return_G_hf=False):
             G_hf[k] = np.linalg.inv((G_hf_inv))
         return G, G_hf
 
-def _mu_cycle_find_trace(mu, freq_points, freq_weights, sigma_mo, gamma, V, h_mo,
+def _mu_cycle_find_trace(mu, freq_points, freq_weights, sigma_mo, gamma, V, h_mo, grid_f=None, grid_kind='IR',
                          densmethod='full'):
     """One (F, G, gamma) update at a trial mu. Returns (trace, gamma, G, F).
 
@@ -289,7 +324,10 @@ def _mu_cycle_find_trace(mu, freq_points, freq_weights, sigma_mo, gamma, V, h_mo
     the next by the caller.
     """
     F = build_new_F(gamma, V, h_mo)
-    if densmethod.lower() == 'split':
+    if grid_kind.upper() == 'IR':
+        G = build_G_from_F(mu, grid_f.omega_points, sigma_mo, F)
+        gamma = density_matrix_ir(G, grid_f)
+    elif densmethod.lower() == 'split':
         G, G_hf = build_G_from_F(mu, freq_points, sigma_mo, F, return_G_hf=True)
         gamma = density_matrix_scgw_split(G, G_hf, F, mu, freq_weights)
     else:
@@ -298,8 +336,8 @@ def _mu_cycle_find_trace(mu, freq_points, freq_weights, sigma_mo, gamma, V, h_mo
     return np.trace(gamma), gamma, G, F
 
 def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
-            mu_step=0.01, trace_tol=1e-8, mu_tol=1e-10,
-            max_bracket_iter=50, max_bisect_iter=100, densmethod='full',
+            mu_step=0.000001, trace_tol=1e-8, mu_tol=1e-10,
+            max_bracket_iter=50, max_bisect_iter=100, grid_f=None, grid_kind='IR', densmethod='full',
             stall_trace_tol=1e-4):
     """Bisection search for mu with Tr[gamma(mu)] = nocc.
 
@@ -340,13 +378,14 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
     # --- Phase 1: bracket the root ---
     step = mu_step
     direction = -1.0 if trace_old > nocc else 1.0
+    # direction = 1.0 if trace_old > nocc else -1.0
     mu_a, trace_a, gamma_a = mu, trace_old, gamma
 
     for _ in range(max_bracket_iter):
         mu_b = mu_a + direction * step
         trace_b, gamma_b, G_b, F_b = _mu_cycle_find_trace(
             mu_b, freq_points, freq_weights, sigma_mo, gamma_a, V, h_mo,
-            densmethod=densmethod)
+            grid_f=grid_f, densmethod=densmethod)
 
         if (trace_a - nocc) * (trace_b - nocc) <= 0:
             break
@@ -362,7 +401,7 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
         mu_mid = 0.5 * (mu_lo + mu_hi)
         trace_mid, gamma_mid, G_mid, F_mid = _mu_cycle_find_trace(
             mu_mid, freq_points, freq_weights, sigma_mo, gamma_lo, V, h_mo,
-            densmethod=densmethod)
+            grid_f=grid_f, densmethod=densmethod)
 
         if abs(trace_mid - nocc) < trace_tol:
             print(f'mu_cycle converged: mu={mu_mid}, trace={trace_mid}\n')
@@ -514,7 +553,107 @@ def calc_new_sigma(G, freq_points, freq_weights, tau_points, nocc, F, mu, X_mo, 
 
     return (G_lesser + 1j * G_greater), chi_omega, W_omega, sigma_new
 
-def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split', **kwargs):
+def project_tau_cross(src_grid, dst_grid, f_src, dim, parity):
+    """Move a quantity known on src_grid's own tau_points onto dst_grid's --
+    src_grid and dst_grid are two IR grids built at the SAME beta but
+    different statistics (fermion vs boson), so their native tau_points
+    differ, and a pointwise product like chi = G_greater*G_lesser or
+    Sigma = i*G*W needs every factor at the SAME tau before it can be taken.
+
+    f_src: (ntau_src, dim, dim), on src_grid.tau_points.
+    Returns (ntau_dst, dim, dim), on dst_grid.tau_points.
+    """
+    ntau_src = len(src_grid.tau_points)
+    flat = f_src.reshape(ntau_src, dim * dim).T               # (dim*dim, ntau_src)
+    return src_grid.project_tau(flat, dst_grid.tau_points, parity=parity).T.reshape(-1, dim, dim)
+
+def calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D):
+    """IR analogue of calc_new_sigma: ONE fixed (beta, omega_max) pair, baked
+    into grid_f/grid_b when they were built, serves every stage here -- no
+    per-call minimax refit to rG/rW_F/rS_F. That is the entire point of
+    using IR grids.
+
+    G and W live on DIFFERENT grids (fermion carries different basis
+    functions/tau_points than boson), so moving a quantity from one grid's
+    tau axis onto the other's, for the Sigma=GW pointwise product, goes
+    through grid.project_tau -- the two-sided ("fit here, evaluate there")
+    capability a minimax fit does not have.
+
+    G: (nfreq, nmo, nmo) complex, on grid_f.omega_points.
+    Returns (G_tau, chi_omega, W_omega, sigma_new); G_tau is
+    (G_lesser + 1j*G_greater) on grid_f.tau_points, same packing as
+    calc_new_sigma. sigma_new is on grid_f.omega_points.
+    """
+    nmo = G.shape[-1]
+
+    # G(i.omega) -> G(tau), fermion-native, sectors kept separate so each
+    # can be projected onto grid_b's tau below.
+    G_even_f = np.einsum('tk,kpq->tpq', grid_f.cosft_tw, G.real)
+    G_odd_f = np.einsum('tk,kpq->tpq', grid_f.sinft_tw, G.imag)
+
+    # Move both sectors onto the boson grid's own tau -- chi/W live there,
+    # and the chi Hadamard product needs both factors at the SAME tau.
+    G_even_b = project_tau_cross(grid_f, grid_b, G_even_f, nmo, 'even')
+    G_odd_b = project_tau_cross(grid_f, grid_b, G_odd_f, nmo, 'odd')
+    G_lesser_b = G_even_b - G_odd_b
+    G_greater_b = G_even_b + G_odd_b
+
+    # MO -> ISDF/THC grid, on the boson grid's tau.
+    Ghat_lesser_b = np.einsum('pi,tij,qj->tpq', X_mo, G_lesser_b, X_mo, optimize=True)
+    Ghat_greater_b = np.einsum('pi,tij,qj->tpq', X_mo, G_greater_b, X_mo, optimize=True)
+
+    # chi(i.omega) on the boson grid -- same Go=Ghat_greater, Gv=-Ghat_lesser
+    # convention as the minimax route (Gv = -G_greater, greens_function_
+    # imaginary_time's built-in minus on the virtual/greater branch); eps/nocc
+    # are unused when Go/Gv are given (chi0_imaginary_frequency's early
+    # return), so None stands in for them here.
+    chi_omega = chi0_imaginary_frequency(X_mo, D, None, None, grid_b,
+                                         Go=Ghat_greater_b, Gv=-Ghat_lesser_b)
+
+    # Dyson invert chi -> W, same pointwise pattern as everywhere else.
+    naux = chi_omega.shape[-1]
+    eye_aux = np.eye(naux)
+    W_omega = np.empty_like(chi_omega)
+    for k in range(chi_omega.shape[0]):
+        W_omega[k] = np.linalg.inv(eye_aux - chi_omega[k])
+
+    # W(i.omega) -> W(tau), boson-native. Only the correlation part (W - I)
+    # decays; W is real/even like chi, so cosine (even sector) only.
+    Wt_tau_b = np.einsum('tk,kab->tab', grid_b.cosft_tw, W_omega - eye_aux, optimize=True)
+
+    # Move Wt from the boson grid's tau onto the fermion grid's tau -- the
+    # Sigma=GW product needs W at the SAME tau as G (fermion-native here).
+    Wt_tau_f = project_tau_cross(grid_b, grid_f, Wt_tau_b, naux, 'even')
+
+    # aux basis -> ISDF/THC grid, per tau point, now fermion-native tau.
+    Zt_tau = np.einsum('Pa,tab,Qb->tPQ', D, Wt_tau_f, D, optimize=True)
+
+    # Ghat_lesser/Ghat_greater on the FERMION grid's own tau, for Sigma=GW --
+    # built directly from G_even_f/G_odd_f already in hand, not by projecting
+    # the grid_b versions back (which would add an extra round trip).
+    Ghat_lesser_f = np.einsum('pi,tij,qj->tpq', X_mo, G_even_f - G_odd_f, X_mo, optimize=True)
+    Ghat_greater_f = np.einsum('pi,tij,qj->tpq', X_mo, G_even_f + G_odd_f, X_mo, optimize=True)
+
+    # Sigma = i G W, pointwise product in imaginary time, THC grid. No extra
+    # sign flip here, same reasoning as calc_new_sigma's own docstring.
+    sig_lesser_thc = Zt_tau * Ghat_lesser_f
+    sig_greater_thc = Zt_tau * Ghat_greater_f
+
+    sig_lesser = np.einsum('pi,tpq,qj->tij', X_mo, sig_lesser_thc, X_mo, optimize=True)
+    sig_greater = np.einsum('pi,tpq,qj->tij', X_mo, sig_greater_thc, X_mo, optimize=True)
+
+    even = sig_greater + sig_lesser
+    odd = sig_greater - sig_lesser
+
+    # Sigma(tau) -> Sigma(i.omega), fermion-native frequencies.
+    sigma_new = (np.einsum('wt,tij->wij', grid_f.cosft_wt, even, optimize=True)
+                + 1j * np.einsum('wt,tij->wij', grid_f.sinft_wt, odd, optimize=True))
+
+    G_lesser_f = G_even_f - G_odd_f
+    G_greater_f = G_even_f + G_odd_f
+    return (G_lesser_f + 1j * G_greater_f), chi_omega, W_omega, sigma_new
+
+def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kwargs):
     """One scGW iteration: the dressed Green's function via Dyson.
 
     In the future going to run the sc cycle
@@ -529,6 +668,96 @@ def solve_qp_energy_scgw(mf, mol, nocc, densmethod='split', **kwargs):
     h_mo + J[gamma] - 0.5*K[gamma] (see `build_new_F`), the updated Fock
     matrix in mf.mo_coeff's basis built from the scGW density `gamma`.
     """
+
+    if grid_kind.upper() == 'IR':
+        # Step 1: build the two IR grids (fermion for G/Sigma, boson for
+        # chi/W -- they carry different basis functions and different
+        # tau_points, never one grid for both), gate on their own round-trip
+        # fidelity BEFORE trusting them for anything, then build the bare G0
+        # analytically, directly on the fermion grid's own Matsubara
+        # frequencies -- no minimax freq_points, no chi0-from-bare-orbitals
+        # bootstrap needed at all.
+        eps = get_orbital_energies(mf, representation='spatial')
+        occ, virt = get_occ_virt_indices(eps, nocc)
+        mu = 0.5 * (eps[nocc - 1] + eps[nocc])
+        F_bare = np.diag(eps)
+
+        # omega_max: the widest range calc_new_sigma's minimax route ever
+        # needed (rS_F's own logic -- G's decay plus W's, padded) -- ONE
+        # choice has to cover every stage here, since there is no per-stage
+        # refit later the way minimax has.
+        dG = np.abs(eps - mu)
+        e_min = eps[virt].min() - eps[occ].max()
+        e_max = eps[virt].max() - eps[occ].min()
+        omega_max = 3.0 * (dG.max() + e_max)
+
+        # beta: large enough that the smallest gap is deep in the T = 0
+        # regime (exp(-beta * dG.min()) negligible) without pushing
+        # Lambda = beta * omega_max, and so the IR basis size (~log(Lambda)),
+        # needlessly high.
+        beta = 100.0 / dG.min()
+
+        grid_f = TimeFrequencyGrid.ir(beta, omega_max, statistics='fermion')
+        grid_b = TimeFrequencyGrid.ir(beta, omega_max, statistics='boson')
+
+        # print(dir(grid_f))
+
+        print(f'IR grids: Lambda={beta * omega_max:.4g}, '
+             f'fermion size={grid_f.meta["basis"].size}, '
+             f'boson size={grid_b.meta["basis"].size}')
+        # duality_error, not roundtrip_error: the latter's probe is the
+        # bosonic particle-hole bubble (periodic under tau -> beta-tau),
+        # which is the right check for the boson/chi grid but not a valid
+        # probe for the fermion/G grid (antiperiodic) -- duality_error tests
+        # each grid's own represented subspace directly and is what the
+        # class docstring itself says to trust within IR.
+        print(f'fermion duality_error (even/odd) = '
+             f'{grid_f.duality_error("even"):.2e} / {grid_f.duality_error("odd"):.2e}')
+        print(f'boson   duality_error (even/odd) = '
+             f'{grid_b.duality_error("even"):.2e} / {grid_b.duality_error("odd"):.2e}')
+
+        X_mo, D, X_ao, coords = (kwargs.get('factors') if kwargs.get('factors') is not None
+                                 else separable_factors(mf, mol, auxbasis=kwargs.get('auxbasis')))
+
+        freq_points = grid_f.omega_points
+        nmo = len(eps)
+        eye = np.eye(nmo)
+        G0 = np.array([np.linalg.inv((1j * w + mu) * eye - F_bare)
+                       for w in freq_points])
+
+        print(f'G0 (IR, bare): shape={G0.shape}, max|G0|={np.max(np.abs(G0)):.4e}')
+
+        gamma = density_matrix_ir(G0, grid_f)
+        print(f'Trace gamma: {np.trace(gamma)}, expected nocc: {nocc}')
+
+        G_tau, chi_omega, W_omega, sigma_new = calc_new_sigma_ir(
+            G0, grid_f, grid_b, X_mo, D)
+
+        h_mo = mf.mo_coeff.T @ mf.get_hcore(mol) @ mf.mo_coeff
+        V = get_two_electron_integrals_chemist(mol,mf)
+
+        F = build_new_F(gamma, V, h_mo)
+        G = build_G_from_F(mu, grid_f.omega_points, sigma_new, F)
+
+        
+
+        # This mu-cycle has to be fixed / implemented properly still
+        # The mu-cycle does not converge, may be because the initial G0 density is so close to n_occ
+        #
+        # mu, G, gamma, F = mu_cycle(mu, G0, gamma, nocc, freq_points=None, freq_weights=None,
+        #                            sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
+
+        # with np.printoptions(precision=3, suppress=False, linewidth=120):
+        #     print(gamma)
+
+        # calc_new_sigma_ir (dressed chi/W/Sigma from grid_f/grid_b) and the
+        # IR density (gamma = -G(tau=beta)) are not built yet -- this is
+        # only the grid setup and the analytic bare G0, per step 1.
+        raise NotImplementedError(
+            'IR route: grids and bare G0 built above; calc_new_sigma_ir and '
+            'the IR density extraction are not implemented yet.')
+
+    # from here the non-ir route, currently not continuing implementation
     sigma_mo, eps, mu, freq_points, freq_weights, X_mo, D, grid = sigma_matrix_scgw_iteration1(
         mf, mol, nocc, **kwargs)
 

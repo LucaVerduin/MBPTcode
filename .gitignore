@@ -20,6 +20,9 @@ src/Base/data/radii_cache/
 /run_scgw.py
 /run_scgw2.py
 /run_scgw_cycle.py
+/run_scgw_ir.py
+/run_scgw_ir_sigma0.py
 /run_scgw_Ne.py
 /test_frequencies.py
 /scgw2.py
+/run_scgw_ir
