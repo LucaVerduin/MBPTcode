@@ -10,6 +10,10 @@ src/Base/               PySCF interface, constants, linear algebra
     solvent_screening.py  PCM reaction field, with its analytic adjoint
     dispersion.py        the empirical D3/D4 correction
     composite_environment.py, polarizable_sites.py, cppe_interface.py
+    fragment_localization.py  fragment Pipek-Mezey orbitals (pyscf), the
+                        basis of the fragment-partitioned BSE
+    protein_environment.py  a QM region, its fragments and a charges +
+                        polarizable-sites environment from a PQR file
                         QM/MMPol: permanent charges plus induced dipoles
     pcm_factorization.py, pcm_derivatives.py
                         the PCM cavity's cached solve and its nuclear
@@ -18,6 +22,8 @@ src/Base/               PySCF interface, constants, linear algebra
     utils/grids.py      minimax and Gauss-Legendre imaginary-axis grids
     utils/time_frequency.py  one grid object carrying both axes
     utils/matsubara.py  finite-temperature (IR) grids
+    active_space.py     ActiveSpace: an active window of canonical orbitals,
+                        by energy, counts, irrep or Loewdin population
 src/SingleReference/
     ADC/                the ADC solvers (see ADC/__init__.py for the map)
     CC/                 CCSD/CCSDT amplitudes, lambda, EOM
@@ -33,10 +39,23 @@ src/SingleReference/
     BSE/                the upfolded (non-perturbative) BSE
 src/Solvers/            quasiparticle root finders, including the
                         pole-guarded Newton solve contour deformation uses,
-                        and a matrix-free Davidson eigensolver
+                        a matrix-free Davidson eigensolver, and the
+                        ActiveSpaceSolver protocol (FCI, determinant-basis
+                        and DMRG adapters) over an active-space Hamiltonian;
+                        active_space.py dispatches a DOWNFOLDED effective
+                        Hamiltonian over those same adapters by name
+src/MultiReference/
+    QDPT/               active-space downfolding: generated_evaluators(_spinfree).py
+                        (machine-derived MP2/MP3 diagram evaluators, no
+                        generator in this repo) and perturbative.py, which
+                        builds an active space's g_eff from them for
+                        src/Solvers/active_space.py to solve
 src/gradients/          analytic nuclear gradients: one adjoint module per
                         forward one, differentiating production's own objects
 src/properties/         the ONE surface dispatcher, geometry optimization,
                         vibronic analysis, conformers, rates and the
-                        couplings they need
+                        couplings they need; the fragment-diabatic BSE
+                        (fragment_bse.py) and its finite differences
+                        (diabatic.py), whose analytic gradient is
+                        src/gradients/fragment_diabatic.py
 ```

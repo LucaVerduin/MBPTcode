@@ -61,7 +61,7 @@ estimator (not its bits), and the reductions re-associate J and K, so the
 distributed SCF lands on the serial ISDF-K SCF within the SCF's own
 convergence threshold, the same on every rank.
 
-MEASURED, anthracene/cc-pVDZ/LRC-wPBEh on two laptop threads (M 3552 in 7
+MEASURED, anthracene/cc-pVDZ/LRC-wPBEh on two workstation threads (M 3552 in 7
 tiles, nao 246, naux 924, nocc 47), the one-rank handle: the row fit 12.8
 s; one operator's Z rows 0.75 s (31 GF/s); a K build 0.23 s, 34 GF/s on
 2 M^2 (nocc + nao) + 2 M nao^2, against 0.32 s for the serial ISDFJK's K on
@@ -112,6 +112,7 @@ from src.Base.distributed_df import (_counted, _lockstep_density,
                                      _reduce_parts, _spent)
 from src.Base.isdf_jk import ISDFJK, isdf_grid, range_coulomb
 from src.Base.separable_ri import fit_M_streaming
+from src.Base.utils import memory
 from src.Base.utils.mpi_grid import (allgather_ranges, broadcast,
                                      broadcast_rows, contiguous_block,
                                      current_comm, lockstep, partition)
@@ -347,7 +348,7 @@ class DistributedISDFJK(df.df.DF):
             rows = sum(t1 - t0 for t0, t1 in (self.tiles[t]
                                               for t in self.mine))
             mine = 2 * rows * len(self.coords) * 8
-            free = (self.max_memory - lib.current_memory()[0]) * 1e6
+            free = (self.max_memory - memory.current_memory_mb()) * 1e6
             mode = ('dense' if mine < ISDF_SCF_KERNEL_MEMORY_FRACTION * free
                     else 'factored')
         self.z_mode = broadcast(mode, self.comm)
