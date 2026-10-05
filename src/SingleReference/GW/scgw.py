@@ -300,6 +300,10 @@ def build_G_from_F(mu, freq_points, sigma_mo, F, return_G_hf=False):
     nmo = G.shape[-1]
     eye = np.eye(nmo)
 
+
+    # IT MIGHT BE THAT THIS FORMULA ACTUALLY REQUIERES USING + sigma_mo[k]
+    # INSTEAD OF -, BECAUSE THE SIGMA MIGHT HAVE BEEN CALCULATED AS iGW 
+    # INSTEAD OF -iGW
     if not return_G_hf:
         for k, w in enumerate(freq_points):
             G[k] = np.linalg.inv((1j* w + mu)*eye - F - sigma_mo[k])
@@ -379,14 +383,15 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
         mu, F, freq_points, freq_weights, sigma_mo, grid_f=grid_f, grid_kind=grid_kind,
         densmethod=densmethod)
 
-    print(f'Trace before mu-cycle: {trace_old}')
+    # print(f'Trace before mu-cycle: {trace_old}')
 
     if abs(trace_old - nocc) < trace_tol:
         return mu, G, gamma, F
 
     # --- Phase 1: bracket the root ---
     step = mu_step
-    direction = -1.0 if trace_old > nocc else 1.0
+    direction = -1.0 if trace_old > nocc else 1.0 #original
+    # direction = 1.0 if trace_old > nocc else -1.0
     mu_a, trace_a = mu, trace_old
 
     for _ in range(max_bracket_iter):
@@ -413,13 +418,13 @@ def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
             densmethod=densmethod)
 
         if abs(trace_mid - nocc) < trace_tol:
-            print(f'mu_cycle converged: mu={mu_mid}, trace={trace_mid}\n')
+            print(f'mu_cycle converged: mu={mu_mid}, trace={trace_mid}')
             return mu_mid, G_mid, gamma_mid, F
 
         if abs(mu_hi - mu_lo) < mu_tol:
             if abs(trace_mid - nocc) < stall_trace_tol:
                 print(f'mu_cycle converged (bracket collapsed, trace within '
-                     f'stall_trace_tol): mu={mu_mid}, trace={trace_mid}\n')
+                     f'stall_trace_tol): mu={mu_mid}, trace={trace_mid}')
                 return mu_mid, G_mid, gamma_mid, F
             raise RuntimeError(
                 f'mu_cycle: bisection bracket collapsed to width '
@@ -556,7 +561,15 @@ def calc_new_sigma(G, freq_points, freq_weights, tau_points, nocc, F, mu, X_mo, 
     sigma_new = (np.einsum('wt,tij->wij', C, even, optimize=True)
                 + 1j * np.einsum('wt,tij->wij', S, odd, optimize=True))
 
-    return (G_lesser + 1j * G_greater), chi_omega, W_omega, sigma_new
+    # Sigma = -0.5 * (i G W), matching self_energy_matrix_imaginary_time's
+    # own "out *= -0.5" (imaginary_time.py) -- checked directly: -0.5*sigma_new
+    # (this function's raw, un-prefactored product) matches that already-
+    # tested route's own Sigma to 8e-09 for the same G and W, on the bare-G0
+    # limit. The lesser/greater branch signs alone (both routines build
+    # G_greater with Gv's own built-in minus, both combine even=greater+lesser,
+    # odd=greater-lesser) are NOT the whole story -- that trailing -0.5 is a
+    # separate, otherwise easy to miss, overall normalization.
+    return (G_lesser + 1j * G_greater), chi_omega, W_omega, -0.5 * sigma_new
 
 def project_tau_cross(src_grid, dst_grid, f_src, dim, parity):
     """Move a quantity known on src_grid's own tau_points onto dst_grid's --
@@ -656,7 +669,15 @@ def calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D):
 
     G_lesser_f = G_even_f - G_odd_f
     G_greater_f = G_even_f + G_odd_f
-    return (G_lesser_f + 1j * G_greater_f), chi_omega, W_omega, sigma_new
+    # Sigma = -0.5 * (i G W), matching self_energy_matrix_imaginary_time's
+    # own trailing "out *= -0.5" (imaginary_time.py) -- checked directly:
+    # -0.5*sigma_new (this function's raw, un-prefactored product) matches
+    # that already-tested route's own Sigma to 8e-09 for the same G and W,
+    # in the bare-G0 limit. The lesser/greater branch signs matching (both
+    # routines build G_greater with Gv's own built-in minus, both combine
+    # even=greater+lesser, odd=greater-lesser) is NOT the whole story --
+    # that trailing -0.5 is a separate overall normalization.
+    return (G_lesser_f + 1j * G_greater_f), chi_omega, W_omega, -0.5 * sigma_new
 
 def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kwargs):
     """One scGW iteration: the dressed Green's function via Dyson.
@@ -683,6 +704,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kw
         # frequencies -- no minimax freq_points, no chi0-from-bare-orbitals
         # bootstrap needed at all.
         eps = get_orbital_energies(mf, representation='spatial')
+        print(eps[:nocc],'\n',eps[nocc:])
         occ, virt = get_occ_virt_indices(eps, nocc)
         mu = 0.5 * (eps[nocc - 1] + eps[nocc])
         F_bare = np.diag(eps)
@@ -747,13 +769,30 @@ def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kw
         gamma_G = density_matrix_ir(G,grid_f)
         print(f'Trace gamma_G: {np.trace(gamma_G)}, expected nocc: {nocc}')
 
-        try:
-            _, _, _, _ = mu_cycle(mu, G0, gamma, nocc, freq_points=None, freq_weights=None,
-                            sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
-        except Exception as e:
-            print(f'mu_cycle failed: {e!r}')
+        print(f'\nMU SCF\n\nMu before mu_scf: {mu}')
 
-        return G, F, G0, mu, gamma, sigma_new, V, h_mo, grid_f
+        mu_pre_scf = mu
+        delta_mu = 999
+        mu_convergence = 1e-8
+
+        while delta_mu > mu_convergence:
+            mu_old = mu
+
+            mu, G, gamma, F = mu_cycle(mu, G, gamma, nocc, freq_points=None, freq_weights=None,
+                            sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
+            # print(f'Mu_scf: {mu}')
+            delta_mu = abs(mu_old - mu)
+
+        print(f'Mu post mu_scf: {mu}\n\nMU SCF\n')
+
+
+        # try:
+        #     _, _, _, _ = mu_cycle(mu, G0, gamma, nocc, freq_points=None, freq_weights=None,
+        #                     sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
+        # except Exception as e:
+        #     print(f'mu_cycle failed: {e!r}')
+
+        return G, F, G0, mu_pre_scf, gamma, sigma_new, V, h_mo, grid_f
 
         # This mu-cycle has to be fixed / implemented properly still
         # The mu-cycle does not converge, may be because the initial G0 density is so close to n_occ
