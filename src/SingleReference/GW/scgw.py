@@ -339,7 +339,7 @@ def _mu_cycle_find_trace(mu, F, freq_points, freq_weights, sigma_mo, grid_f=None
     return np.trace(gamma), gamma, G
 
 def mu_cycle(mu, G, gamma, nocc, freq_points, freq_weights, sigma_mo, V, h_mo,
-            mu_step=0.000001, trace_tol=1e-8, mu_tol=1e-10,
+            mu_step=0.000001, trace_tol=1e-5, mu_tol=1e-10,
             max_bracket_iter=50, max_bisect_iter=100, grid_f=None, grid_kind='IR', densmethod='full',
             stall_trace_tol=1e-4):
     """Bisection search for mu with Tr[gamma(mu)] = nocc, at FIXED F.
@@ -679,7 +679,7 @@ def calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D):
     # that trailing -0.5 is a separate overall normalization.
     return (G_lesser_f + 1j * G_greater_f), chi_omega, W_omega, -0.5 * sigma_new
 
-def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kwargs):
+def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', densmethod='split', **kwargs):
     """One scGW iteration: the dressed Green's function via Dyson.
 
     In the future going to run the sc cycle
@@ -718,20 +718,48 @@ def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kw
         e_max = eps[virt].max() - eps[occ].min()
         omega_max = 3.0 * (dG.max() + e_max)
 
-        # beta: large enough that the smallest gap is deep in the T = 0
-        # regime (exp(-beta * dG.min()) negligible) without pushing
-        # Lambda = beta * omega_max, and so the IR basis size (~log(Lambda)),
-        # needlessly high.
+        # beta: large enough that the smallest gap is in the T = 0 regime
+        # (thermal occupation exp(-beta * dG.min()) = exp(-25) ~ 1e-11), and
+        # no larger. Lambda = beta * omega_max sets the conditioning of the
+        # omega -> tau fit, not just the basis size: the Matsubara sampling
+        # barely reaches past omega_max at large Lambda, so the 1/(i.omega)
+        # tail that fixes G(tau -> 0, beta) -- the density -- is extrapolated
+        # rather than sampled. Measured on Ne/cc-pVDZ: 100/dG.min() (Lambda
+        # 1.7e4, odd-sector cond 4e5) lets the G -> Sigma -> G iteration blow
+        # up within ~5 iterations; 25/dG.min() (Lambda 4e3, cond 4e4) is stable.
         beta = 100.0 / dG.min()
 
-        grid_f = TimeFrequencyGrid.ir(beta, omega_max, statistics='fermion')
-        grid_b = TimeFrequencyGrid.ir(beta, omega_max, statistics='boson')
+        # Matsubara search window: default_matsubara_sampling only offers
+        # candidate frequencies up to
+        #     omega_top / omega_max ~ 1 + factor * size * 2 pi / Lambda,
+        # which at the default factor = 4 is 1.1 - 1.4 x omega_max -- the
+        # extrema of the highest basis functions above that are never
+        # sampled, and the omega -> tau fit is ill-conditioned in exactly the
+        # directions that fix G(tau -> 0, beta). Measured on Ne/cc-pVDZ at
+        # Lambda = 1.7e4: reach 1.12 -> odd-sector cond 4e5 and a divergent
+        # G -> Sigma -> G iteration; reach 5.4 -> cond 2e2, stable. Solve the
+        # relation above for the factor that gives `reach`; size_guess is an
+        # upper estimate of the IR size (60 - 100 here), so the true reach
+        # comes out somewhat below `reach` rather than above it.
+        reach = 6.0
+        size_guess = 100
+        n_matsubara_factor = int(np.ceil(
+            (reach - 1.0) * beta * omega_max / (2 * np.pi * size_guess)))
+
+        grid_f = TimeFrequencyGrid.ir(beta, omega_max, statistics='fermion',
+                                      n_matsubara_factor=n_matsubara_factor)
+        
+        grid_b = TimeFrequencyGrid.ir(beta, omega_max, statistics='boson',
+                                      n_matsubara_factor=n_matsubara_factor)
 
         # print(dir(grid_f))
 
         print(f'IR grids: Lambda={beta * omega_max:.4g}, '
              f'fermion size={grid_f.meta["basis"].size}, '
-             f'boson size={grid_b.meta["basis"].size}')
+             f'boson size={grid_b.meta["basis"].size}, '
+             f'n_matsubara_factor={n_matsubara_factor}, '
+             f'highest sampled omega = '
+             f'{grid_f.omega_points.max() / omega_max:.2f} x omega_max')
         # duality_error, not roundtrip_error: the latter's probe is the
         # bosonic particle-hole bubble (periodic under tau -> beta-tau),
         # which is the right check for the boson/chi grid but not a valid
@@ -766,33 +794,52 @@ def solve_qp_energy_scgw(mf, mol, nocc, grid_kind='IR', densmethod='split', **kw
         F = build_new_F(gamma, V, h_mo)
         G = build_G_from_F(mu, grid_f.omega_points, sigma_new, F)
 
-        gamma_G = density_matrix_ir(G,grid_f)
-        print(f'Trace gamma_G: {np.trace(gamma_G)}, expected nocc: {nocc}')
+        if skip_scf:
+            return G, F, G0, mu, V, h_mo, grid_f, grid_b, X_mo, D
 
-        print(f'\nMU SCF\n\nMu before mu_scf: {mu}')
+        delta_gamma = 999
+        gamma_convergence = 1e-6
 
-        mu_pre_scf = mu
-        delta_mu = 999
-        mu_convergence = 1e-8
+        alpha = 0.6
 
-        while delta_mu > mu_convergence:
+        gamma = density_matrix_ir(G, grid_f)
+        _, _, _, sigma_new = calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D)
+
+        while delta_gamma > gamma_convergence:
+            gamma_old = gamma
+            sigma_old = sigma_new
             mu_old = mu
 
-            mu, G, gamma, F = mu_cycle(mu, G, gamma, nocc, freq_points=None, freq_weights=None,
-                            sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
-            # print(f'Mu_scf: {mu}')
+            _, _, _, sigma_new = calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D)
+
+            delta_sigma = np.max(np.abs(sigma_old - sigma_new))
+
+            mu_pre_scf = mu
+
+
+            delta_mu = 999
+            mu_convergence = 1e-3
+
+            while delta_mu > mu_convergence:
+                mu_old = mu
+
+                mu, G, gamma, F = mu_cycle(mu, G, gamma, nocc, freq_points=None, freq_weights=None,
+                                sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
+
+                delta_mu = abs(mu_old - mu)
+
+            print(f'Mu post mu_scf: {mu}')
+
+            gamma = alpha * gamma + (1 - alpha) * gamma_old
+
             delta_mu = abs(mu_old - mu)
 
-        print(f'Mu post mu_scf: {mu}\n\nMU SCF\n')
+            delta_gamma = np.max(np.abs(gamma - gamma_old))
+            delta_mu = np.abs(mu - mu_old)
+            print(f'Delta gamma: {delta_gamma}\nDelta mu: {delta_mu}\nDelta Sigma: {delta_sigma}\n\n')
 
 
-        # try:
-        #     _, _, _, _ = mu_cycle(mu, G0, gamma, nocc, freq_points=None, freq_weights=None,
-        #                     sigma_mo=sigma_new, V=V, h_mo=h_mo, grid_f=grid_f, grid_kind='IR')
-        # except Exception as e:
-        #     print(f'mu_cycle failed: {e!r}')
-
-        return G, F, G0, mu_pre_scf, gamma, sigma_new, V, h_mo, grid_f
+        return G, F, G0, mu_pre_scf, gamma, sigma_new, V, h_mo, grid_f, grid_b, X_mo, D
 
         # This mu-cycle has to be fixed / implemented properly still
         # The mu-cycle does not converge, may be because the initial G0 density is so close to n_occ
