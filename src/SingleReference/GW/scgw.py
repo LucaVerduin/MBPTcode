@@ -714,7 +714,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_fil
     # The frequency window runs from the lowest valence level to the highest
     # level of F, with 0.5 Ha margin. eta is the broadening; the frequency
     # step is finer, so each peak (half-width ~eta) is well sampled.
-    eta = 1e-2
+    eta = kwargs.get('eta') or 1e-2
     w_step = eta / 10
 
     eps_F = np.linalg.eigvalsh(F)
