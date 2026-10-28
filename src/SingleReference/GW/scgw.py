@@ -23,6 +23,7 @@ import numpy as np
 import scipy.signal
 import resource
 
+from pyscf import df, lib
 from pyscf.data.elements import chemcore
 from src.SingleReference.CC.diis import DIIS
 from src.Base.numerics.constants import SURFACE_GRID_ACCURACY
@@ -309,7 +310,7 @@ def project_tau_cross(src_grid, dst_grid, f_src, dim, parity):
     f_dst = src_grid.project_tau(flat, dst_grid.tau_points, parity=parity).T
     return np.ascontiguousarray(f_dst).reshape(-1, dim, dim)
 
-def calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D, return_all=False):
+def calc_new_sigma_isdf(G, grid_f, grid_b, X_mo, D, return_all=False):
     """Correlation self-energy Sigma(i.omega) from a dressed G(i.omega).
 
     Steps: G -> chi = G*G -> W = [I - chi]^-1 -> Sigma = G*W. The products
@@ -426,6 +427,113 @@ def calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D, return_all=False):
     G_greater_f = G_even_f + G_odd_f
     return (G_lesser_f + 1j * G_greater_f), chi_omega, W_omega, sigma_new
 
+def calc_new_sigma_ri(G, grid_f, grid_b, B, return_all=False):
+    """Correlation self-energy Sigma(i.omega) from a dressed G(i.omega), with
+    the Coulomb interaction in plain RI instead of the ISDF/THC factors.
+
+    The same workflow as `calc_new_sigma_isdf`, G -> chi = G*G -> W = [I - chi]^-1
+    -> Sigma = G*W, with the same grids, transforms and normalization. Only
+    the two products in tau change: with B[P,p,q] ~ sum_g X_mo[g,p] X_mo[g,q] D[g,P]
+    the elementwise products on the ISDF grid become contractions over MO
+    indices,
+        chi_PQ(tau)  = sum B[P,p,r] G_lesser[p,q] G_greater[r,s] B[Q,q,s]
+        Sigma_pq(tau) = sum B[P,p,r] G[r,s] (W - I)[P,Q] B[Q,s,q],
+    so chi and W are in the same auxiliary basis as with ISDF. Cost per tau
+    point is O(naux nmo^3 + naux^2 nmo^2).
+
+    G: (nfreq, nmo, nmo) complex, on grid_f.omega_points.
+    B: (naux, nmo, nmo) RI three-index tensor in the MO basis, already
+        contracted with the Coulomb metric, (pq|rs) = sum_P B[P,p,q] B[P,r,s].
+    return_all: also return the intermediates; otherwise only sigma_new is
+        returned.
+
+    Returns sigma_new, or with return_all=True (G_tau, chi_omega, W_omega, sigma_new),
+    as `calc_new_sigma_isdf`.
+    """
+    nmo = G.shape[-1]
+    naux = B.shape[0]
+
+    # G(i.omega) -> G(tau) on the fermion grid, even and odd parts separately.
+    G_even_f = np.einsum('tk,kpq->tpq', grid_f.cosft_tw, G.real)
+    G_odd_f = np.einsum('tk,kpq->tpq', grid_f.sinft_tw, G.imag)
+
+    # chi lives on the boson grid, so move G onto the boson tau points.
+    G_even_b = project_tau_cross(grid_f, grid_b, G_even_f, nmo, 'even')
+    G_odd_b = project_tau_cross(grid_f, grid_b, G_odd_f, nmo, 'odd')
+
+    # chi(tau): M_P = G_lesser^T B_P G_greater, then pi_PQ = sum_qs M_P[q,s] B_Q[q,s]
+    # (lesser = even - odd, greater = even + odd, as in calc_new_sigma_isdf).
+    B_flat = B.reshape(naux, nmo * nmo)
+    pi_aux = np.empty((len(grid_b.tau_points), naux, naux))
+    for t in range(len(grid_b.tau_points)):
+        G_lesser = G_even_b[t] - G_odd_b[t]
+        G_greater = G_even_b[t] + G_odd_b[t]
+        M = np.matmul(G_lesser.T @ B, G_greater)
+        pi_aux[t] = M.reshape(naux, nmo * nmo) @ B_flat.T
+    del G_even_b, G_odd_b, M
+    chi_omega = 2.0 * np.tensordot(grid_b.cosft_wt, pi_aux, axes=(1, 0))
+    del pi_aux
+
+    # W = [I - chi]^-1 at each frequency.
+    eye_aux = np.eye(naux)
+    W_omega = np.empty_like(chi_omega)
+    for k in range(chi_omega.shape[0]):
+        W_omega[k] = np.linalg.inv(eye_aux - chi_omega[k])
+    if not return_all:
+        del chi_omega
+
+    # W(i.omega) -> W(tau). Only the correlation part W - I is transformed
+    # (the constant does not decay), and it is even, so cosine only.
+    Wt_tau_b = np.einsum('tk,kab->tab', grid_b.cosft_tw, W_omega - eye_aux, optimize=True)
+    if not return_all:
+        del W_omega
+
+    # Sigma lives on the fermion grid, so move W onto the fermion tau points.
+    Wt_tau_f = project_tau_cross(grid_b, grid_f, Wt_tau_b, naux, 'even')
+    del Wt_tau_b
+
+    # Sigma(tau): V_P = sum_Q (W - I)[P,Q] B_Q, then
+    #     even = sum_P B_P G_even V_P,  odd = sum_P B_P G_odd V_P,
+    # the RI form of 2 X^T [(X G X^T) * Z] X; the prefactor -0.5 is the same
+    # as in calc_new_sigma_isdf. The sum over P and r is one (nmo, naux*nmo)
+    # x (naux*nmo, nmo) product.
+    B_left = np.ascontiguousarray(B.transpose(1, 0, 2)).reshape(nmo, naux * nmo)
+    even = np.empty((len(grid_f.tau_points), nmo, nmo))
+    odd = np.empty_like(even)
+    for t in range(len(grid_f.tau_points)):
+        V = np.tensordot(Wt_tau_f[t], B, axes=(1, 0))
+        even[t] = B_left @ np.matmul(G_even_f[t], V).reshape(naux * nmo, nmo)
+        odd[t] = B_left @ np.matmul(G_odd_f[t], V).reshape(naux * nmo, nmo)
+    del V, B_left, Wt_tau_f
+
+    sigma_new = -(np.tensordot(grid_f.cosft_wt, even, axes=(1, 0))
+                  + 1j * np.tensordot(grid_f.sinft_wt, odd, axes=(1, 0)))
+    del even, odd
+
+    if not return_all:
+        return sigma_new
+
+    G_lesser_f = G_even_f - G_odd_f
+    G_greater_f = G_even_f + G_odd_f
+    return (G_lesser_f + 1j * G_greater_f), chi_omega, W_omega, sigma_new
+
+def calc_new_sigma(G, grid_f, grid_b, X_mo=None, D=None, B=None, method='ISDF',
+                   return_all=False):
+    """Correlation self-energy Sigma(i.omega), by `calc_new_sigma_isdf`
+    (method='ISDF', needs X_mo and D) or `calc_new_sigma_ri` (method='RI',
+    needs B). Returns what the chosen routine returns.
+    """
+    method = method.upper()
+    if method == 'ISDF':
+        if X_mo is None or D is None:
+            raise ValueError("method='ISDF' needs X_mo and D")
+        return calc_new_sigma_isdf(G, grid_f, grid_b, X_mo, D, return_all=return_all)
+    if method == 'RI':
+        if B is None:
+            raise ValueError("method='RI' needs B")
+        return calc_new_sigma_ri(G, grid_f, grid_b, B, return_all=return_all)
+    raise ValueError(f"Unknown method {method!r}, expected 'ISDF' or 'RI'")
+
 def pack_sigma_F(sigma, F, sigma_weight=1.0):
     """(Sigma, F) as one real vector, for DIIS.
 
@@ -459,7 +567,7 @@ def unpack_G(x, G_shape):
     n = int(np.prod(G_shape))
     return (x[:n] + 1j * x[n:]).reshape(G_shape)
 
-def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_file=None, **kwargs):
+def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, method='ISDF', grid_kind='IR', save_file=None, **kwargs):
     """Self-consistent GW quasiparticle energies on IR grids.
 
     Starts from the mean-field G0, iterates Sigma and F to self-consistency
@@ -474,9 +582,12 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_fil
     skip_scf: stop after the first Dyson step (see Returns).
     grid_kind: only 'IR' is implemented.
     save_file: if given, (w_real, A) is written there as CSV.
+    method: 'ISDF' (separable factors) or 'RI' (plain RI three-index
+        tensor, needs `auxbasis`); see `calc_new_sigma`.
     kwargs: `factors` (precomputed output of `separable_factors`) or
         `auxbasis` and `grid_accuracy` (ISDF grid level, default
-        SURFACE_GRID_ACCURACY; used to build them); `beta` and `omega_max` override
+        SURFACE_GRID_ACCURACY; used to build them); `auxbasis` is also the
+        RI auxiliary basis; `eta` the real-axis broadening; `beta` and `omega_max` override
         the IR grid parameters that are otherwise derived from mf's
         orbital energies (e.g. to run different starts on the same grid);
         `diis_size`, `diis_start` and `mixing` override DIIS_SIZE,
@@ -549,10 +660,25 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_fil
     print(f'boson   duality_error (even/odd) = '
             f'{grid_b.duality_error("even"):.2e} / {grid_b.duality_error("odd"):.2e}\n')
 
-    X_mo, D, _, _ = (kwargs.get('factors') if kwargs.get('factors') is not None
-                                else separable_factors(mf, mol, auxbasis=kwargs.get('auxbasis'),
-                                                       grid_accuracy=kwargs.get('grid_accuracy',
-                                                                                SURFACE_GRID_ACCURACY)))
+    method = method.upper()
+    if method == 'ISDF':
+        X_mo, D, _, _ = (kwargs.get('factors') if kwargs.get('factors') is not None
+                                    else separable_factors(mf, mol, auxbasis=kwargs.get('auxbasis'),
+                                                        grid_accuracy=kwargs.get('grid_accuracy',
+                                                                                    SURFACE_GRID_ACCURACY)))
+        Lpq = None
+        B = None
+    elif method == 'RI':
+        if kwargs.get('auxbasis') is None:
+            raise ValueError("If method == 'RI' auxbasis must be specified")
+        Lpq = df.incore.cholesky_eri(mol, auxbasis=kwargs.get('auxbasis'))
+        B = lib.unpack_tril(Lpq)
+        B = np.einsum('Pmn,mp,nq->Ppq', B, mf.mo_coeff, mf.mo_coeff, optimize=True)
+
+        X_mo = None
+        D = None
+    else:
+        raise ValueError(f"Unknown method {method!r}, expected 'ISDF' or 'RI'")
 
     # --- First iteration: G0 -> gamma, Sigma -> F -> G ---
     freq_points = grid_f.omega_points
@@ -566,7 +692,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_fil
     gamma = density_matrix_ir(G0, grid_f)
     print(f'Trace gamma_G0: {np.trace(gamma)}, expected nocc: {nocc}\n')
 
-    sigma_new = calc_new_sigma_ir(G0, grid_f, grid_b, X_mo, D)
+    sigma_new = calc_new_sigma(G0, grid_f, grid_b, X_mo=X_mo, D=D, B=B, method=method)
 
     h_mo = mf.mo_coeff.T @ mf.get_hcore(mol) @ mf.mo_coeff
     e_nuc = mol.energy_nuc()
@@ -623,7 +749,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_fil
         mu_old = mu
         if mix == 'sigma_F':
             # 1. Outputs from the current G
-            sigma_out = calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D)
+            sigma_out = calc_new_sigma(G, grid_f, grid_b, X_mo=X_mo, D=D, B=B, method=method)
             F_out = build_new_F(gamma, mf, h_mo)
 
             # 2. Residual
@@ -643,7 +769,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_fil
             del sigma_out, F_out, r_sigma, r_F
         else:
             # 1. G_out from the current G_in
-            sigma_in = calc_new_sigma_ir(G, grid_f, grid_b, X_mo, D)
+            sigma_in = calc_new_sigma(G, grid_f, grid_b, X_mo=X_mo, D=D, B=B, method=method)
             F_in = build_new_F(gamma, mf, h_mo)
             mu, G_out, gamma_out = mu_cycle(mu, F_in, nocc, sigma_mo=sigma_in,
                                             grid_f=grid_f, grid_kind='IR')
@@ -718,7 +844,7 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, grid_kind='IR', save_fil
     # The frequency window runs from the lowest valence level to the highest
     # level of F, with 0.5 Ha margin. eta is the broadening; the frequency
     # step is finer, so each peak (half-width ~eta) is well sampled.
-    eta = 1e-2
+    eta = kwargs.get('eta', 1e-2)
     w_step = eta / 10
 
     eps_F = np.linalg.eigvalsh(F)
