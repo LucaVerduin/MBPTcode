@@ -31,7 +31,8 @@ from src.Base.pyscf.pyscf_interface import get_orbital_energies
 from src.Base.utils.grids.time_frequency import (TimeFrequencyGrid)
 from src.Base.orbital_spaces import get_occ_virt_indices
 from src.SingleReference.GW.space_time import separable_factors
-from src.Base.utils.grids.analytic_continuation import pade_continue_elementwise
+from src.Base.utils.grids.analytic_continuation import (pade_fit_elementwise,
+                                                        pade_eval_elementwise)
 
 # --- Convergence parameters ---
 # Outer scGW cycle
@@ -49,6 +50,9 @@ MU_TOL = 1e-10              # smallest bisection bracket width
 STALL_TRACE_TOL = 1e-4      # |Tr[gamma] - nocc| still accepted at that width
 MAX_BRACKET_ITER = 50
 MAX_BISECT_ITER = 100
+
+# Real axis
+PADE_EVAL_CHUNK = 16        # real frequencies per Sigma(w) / G(w) evaluation in trace_Greal_from_pade
 
 def density_matrix_ir(G, grid_f):
     """Density matrix from G: gamma = -G(tau = beta).
@@ -187,6 +191,23 @@ def build_Greal_from_F(freq_points, sigma_real, F, eta, trace_only=False):
         G_w[i] = np.linalg.inv((w + 1j*eta)*eye - F - sigma_real[i])
 
     return G_w
+
+def trace_Greal_from_pade(freq_points, Z, A, F, eta, chunk=PADE_EVAL_CHUNK):
+    """Tr[G(z)] at z = omega + i.eta, with Sigma(z) evaluated from its Pade fit.
+
+    Same G as build_Greal_from_F with trace_only=True, but Sigma(z) comes from
+    the fit (Z, A) of pade_fit_elementwise, chunk frequencies at a time, so
+    neither the (nfreq, nmo, nmo) Sigma nor G is ever stored: memory is the
+    fit plus a few (chunk, nmo, nmo) arrays, whatever the number of frequencies.
+    """
+    eye = np.eye(F.shape[0])
+    tr_G = np.empty(len(freq_points), dtype=complex)
+    for start in range(0, len(freq_points), chunk):
+        z = np.asarray(freq_points[start:start + chunk]) + 1j*eta
+        sigma = pade_eval_elementwise(z, Z, A)
+        tr_G[start:start + chunk] = np.trace(
+            np.linalg.inv(z[:, None, None]*eye - F - sigma), axis1=1, axis2=2)
+    return tr_G
 
 def _mu_cycle_find_trace(mu, F, sigma_mo, grid_f, grid_kind='IR'):
     """Build G and gamma for one trial mu, with F and Sigma fixed.
@@ -857,19 +878,19 @@ def solve_qp_energy_scgw(mf, mol, nocc, skip_scf=False, method='ISDF', grid_kind
     pade_max_order = 24
 
     z_fit = mu + 1j * grid_f.omega_points
-    z_real = w_real + 1j * eta
 
-    sigma_real = pade_continue_elementwise(z_fit, sigma_new, z_real, greedy=True,
-                                        symmetric=True, max_order=pade_max_order) 
-    # print(f'SigmaReal: {sigma_real.nbytes / 2**30:.3f} GiB')
+    # Fit once; Sigma(w) is then evaluated a chunk of frequencies at a time
+    # inside trace_Greal_from_pade, so (len(w_real), nmo, nmo) is never stored.
+    pade_Z, pade_A = pade_fit_elementwise(z_fit, sigma_new, greedy=True,
+                                          symmetric=True, max_order=pade_max_order)
 
     print(f'\nSigma(w) on {len(w_real)} real frequencies in [{w_real[0]}, {w_real[-1]}] Ha, '
-        f'eta = {eta}: shape {sigma_real.shape}')
+        f'eta = {eta}: Pade fit {pade_Z.shape}')
     print(f'Pade check, max |Sigma_pade(i*w_n) - Sigma(i*w_n)|: '
-        f'{np.max(np.abs(pade_continue_elementwise(z_fit, sigma_new, z_fit, symmetric=True, max_order=pade_max_order) - sigma_new))}\n')
+        f'{np.max(np.abs(pade_eval_elementwise(z_fit, pade_Z, pade_A) - sigma_new))}\n')
 
-    tr_G_w = build_Greal_from_F(w_real, sigma_real, F, eta, trace_only=True)
-    del sigma_real
+    tr_G_w = trace_Greal_from_pade(w_real, pade_Z, pade_A, F, eta)
+    del pade_Z, pade_A
     A = -1/np.pi * tr_G_w.imag
 
     if save_file is not None:
